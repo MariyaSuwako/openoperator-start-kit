@@ -6,7 +6,7 @@
 
 ## Quick Start
 
-1. Fork此仓库
+1. Fork此仓库，将仓库可见范围设置为private，将bot帐号加入collaborators
 2. 点击`settings`->`webhooks`->`Add webhook`，配置webhook
    1. `Payload URL`填写`http://152.136.18.42:8000/webhook`
    2. `Content type`选择`application/json`
