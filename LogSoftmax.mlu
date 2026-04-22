@@ -32,12 +32,6 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, int 
         // 2. 计算 min(0, x) = x - relu(x)
         __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
 
-        // 3. 计算 negative_slope * min(0, x)
-        __bang_mul_scalar(nram_temp, nram_temp, dim, aligned_len);
-
-        // 4. 计算 leaky_relu(x) = relu(x) + dim * min(0, x)
-        __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
-
         // 写回 GDRAM（只写有效长度）
         __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
     }
