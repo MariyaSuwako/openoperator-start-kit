@@ -4,7 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
+__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, int dim) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -33,9 +33,9 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
         __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
 
         // 3. 计算 negative_slope * min(0, x)
-        __bang_mul_scalar(nram_temp, nram_temp, negative_slope, aligned_len);
+        __bang_mul_scalar(nram_temp, nram_temp, dim, aligned_len);
 
-        // 4. 计算 leaky_relu(x) = relu(x) + negative_slope * min(0, x)
+        // 4. 计算 leaky_relu(x) = relu(x) + dim * min(0, x)
         __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
 
         // 写回 GDRAM（只写有效长度）
@@ -43,7 +43,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
     }
 }
 
-torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
+torch::Tensor bang_func(torch::Tensor input, int dim) {
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
 
     auto output = torch::empty_like(input);
@@ -61,7 +61,7 @@ torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
         input.data_ptr<float>(),
         output.data_ptr<float>(),
         total,
-        negative_slope
+        dim
     );
 
     return output;
