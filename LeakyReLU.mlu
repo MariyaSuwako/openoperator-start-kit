@@ -1,7 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include"half.h"
+#include"half.hpp"
 
 #define CHUNK_SIZE 32768
 
