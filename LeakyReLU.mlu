@@ -42,7 +42,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         __memcpy(output + start + offset, nram_temp, len * sizeof(half), NRAM2GDRAM);
     }
 }
-
+ 
 torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
 
