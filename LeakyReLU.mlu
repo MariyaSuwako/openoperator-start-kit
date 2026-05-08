@@ -4,7 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void leakyrelu_kernel(__half *input, __half *output, int total, __half negative_slope) {
+__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -14,9 +14,9 @@ __mlu_entry__ void leakyrelu_kernel(__half *input, __half *output, int total, __
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ __half nram_input[CHUNK_SIZE];
-    __nram__ __half nram_relu[CHUNK_SIZE];
-    __nram__ __half nram_temp[CHUNK_SIZE];
+    __nram__ float nram_input[CHUNK_SIZE];
+    __nram__ float nram_relu[CHUNK_SIZE];
+    __nram__ float nram_temp[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
@@ -24,7 +24,7 @@ __mlu_entry__ void leakyrelu_kernel(__half *input, __half *output, int total, __
         uint32_t aligned_len = (len + 63) & ~63;
 
         // 从 GDRAM 加载数据到 NRAM
-        __memcpy(nram_input, input + start + offset, len * sizeof(__half), GDRAM2NRAM);
+        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
 
         // 1. 计算 relu(x) = max(0, x)
         __bang_active_relu(nram_relu, nram_input, aligned_len);
@@ -39,15 +39,15 @@ __mlu_entry__ void leakyrelu_kernel(__half *input, __half *output, int total, __
         __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
 
         // 写回 GDRAM（只写有效长度）
-        __memcpy(output + start + offset, nram_temp, len * sizeof(__half), NRAM2GDRAM);
+        __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
-
+    input_f = input.to(torch::kFloat);
     auto output = torch::empty_like(input);
-    int total = input.numel();
+    int total = input_f.numel();
 
     // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -58,8 +58,8 @@ torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
 
     // 启动 kernel
     leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input.data_ptr<__half>(),
-        output.data_ptr<__half>(),
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
         total,
         negative_slope
     );
