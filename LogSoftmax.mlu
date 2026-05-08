@@ -47,11 +47,11 @@ torch::Tensor bang_func(torch::Tensor input, int dim) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     // 配置任务维度（使用 4 个 core）
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim0 = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     // 启动 kernel
-    leakyrelu_kernel<<<dim, ktype, queue>>>(
+    leakyrelu_kernel<<<dim0, ktype, queue>>>(
         input.data_ptr<float>(),
         output.data_ptr<float>(),
         total,
