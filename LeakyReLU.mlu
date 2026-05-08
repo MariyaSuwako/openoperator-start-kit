@@ -58,8 +58,8 @@ torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
 
     // 启动 kernel
     leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input.data_ptr<float>(),
-        output.data_ptr<float>(),
+        input.data_ptr<__half>(),
+        output.data_ptr<__half>(),
         total,
         negative_slope
     );
