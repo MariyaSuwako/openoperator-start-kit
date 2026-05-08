@@ -56,5 +56,5 @@ torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    return output;
+    return input;
 }
