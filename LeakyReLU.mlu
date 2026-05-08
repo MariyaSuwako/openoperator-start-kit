@@ -4,7 +4,7 @@
 
 #define CHUNK_SIZE 32768
 
-__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total, c10::Half negative_slope) {
+__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total, float negative_slope) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -21,7 +21,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         // Bang C 向量指令要求长度对齐到 64 个 float (256 字节)
-        uint32_t aligned_len = (len + 127) & ~127;
+        uint32_t aligned_len = (len + 63) & ~63;
 
         // 从 GDRAM 加载数据到 NRAM
         __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
