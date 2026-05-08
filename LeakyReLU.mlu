@@ -14,9 +14,9 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ half nram_input[CHUNK_SIZE];
-    __nram__ half nram_relu[CHUNK_SIZE];
-    __nram__ half nram_temp[CHUNK_SIZE];
+    __nram__ bfloat16_t nram_input[CHUNK_SIZE];
+    __nram__ bfloat16_t nram_relu[CHUNK_SIZE];
+    __nram__ bfloat16_t nram_temp[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
@@ -33,13 +33,13 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
 
         // 3. 计算 negative_slope * min(0, x)
-        __bang_mul_scalar(nram_temp, nram_temp, (half)negative_slope, aligned_len);
+        __bang_mul_scalar(nram_temp, nram_temp, (bfloat16_t)negative_slope, aligned_len);
 
         // 4. 计算 leaky_relu(x) = relu(x) + negative_slope * min(0, x)
         __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
 
         // 写回 GDRAM（只写有效长度）
-        __memcpy(output + start + offset, nram_temp, len * sizeof(half), NRAM2GDRAM);
+        __memcpy(output + start + offset, nram_temp, len * sizeof(bfloat16_t), NRAM2GDRAM);
     }
 }
  
