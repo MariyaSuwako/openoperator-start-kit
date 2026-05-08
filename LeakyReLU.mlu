@@ -1,10 +1,10 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cuda_fp16.h>
+
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
+__mlu_entry__ void leakyrelu_kernel(__half *input, __half *output, int total, __half negative_slope) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -14,9 +14,9 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_relu[CHUNK_SIZE];
-    __nram__ float nram_temp[CHUNK_SIZE];
+    __nram__ __half nram_input[CHUNK_SIZE];
+    __nram__ __half nram_relu[CHUNK_SIZE];
+    __nram__ __half nram_temp[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
@@ -24,7 +24,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
         uint32_t aligned_len = (len + 63) & ~63;
 
         // 从 GDRAM 加载数据到 NRAM
-        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_input, input + start + offset, len * sizeof(__half), GDRAM2NRAM);
 
         // 1. 计算 relu(x) = max(0, x)
         __bang_active_relu(nram_relu, nram_input, aligned_len);
@@ -39,7 +39,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
         __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
 
         // 写回 GDRAM（只写有效长度）
-        __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
+        __memcpy(output + start + offset, nram_temp, len * sizeof(__half), NRAM2GDRAM);
     }
 }
 
