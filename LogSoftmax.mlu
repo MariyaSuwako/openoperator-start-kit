@@ -39,7 +39,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, int 
 
 torch::Tensor bang_func(torch::Tensor input, int dim) {
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
-
+    input_f = input.float();
     auto output = torch::empty_like(input);
     int total = input.numel();
 
