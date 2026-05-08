@@ -20,7 +20,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
         __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
         __bang_mul_scalar(nram_output, nram_input, negative_slope, aligned_len);
         __bang_move(mlu_output, nram_output, aligned_len);
-        __bang_atomic_nan_reduce_max(nram_output, nram_input, aligned_len);
+        __bang_atomic_nan_reduce_max(mlu_output, nram_input, aligned_len);
         __memcpy(output + start + offset, nram_input, len * sizeof(float), NRAM2GDRAM);
     }
 }
