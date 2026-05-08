@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 262144
+#define CHUNK_SIZE 32768
 
 __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
     // 多核拆分参数
