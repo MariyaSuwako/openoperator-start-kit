@@ -17,9 +17,10 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
         __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-        __bang_mul_scalar(nram_output, nram_input, negative_slope, aligned_len);
+        __bang_relun(nram_output, nram_input, aligned_len, negative_slope);
+        __bang_sub_scalar(nram_output, nram_output, negative_slope, aligned_len);
+        __bang_mul(nram_output, nram_input, nram_output, aligned_len);
         __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
-        __bang_atomic_nan_reduce_max(output, nram_input, aligned_len);
     }
 }
 
