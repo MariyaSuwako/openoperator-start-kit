@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 8192
+#define CHUNK_SIZE 32768
 
 __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
     uint32_t core_id = taskId;
@@ -12,15 +12,30 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, floa
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
     __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_output[CHUNK_SIZE];
+    __nram__ float nram_temp[CHUNK_SIZE];
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
         __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-        __bang_relun(nram_output, nram_input, aligned_len, negative_slope);
-        __bang_sub_scalar(nram_output, nram_output, negative_slope, aligned_len);
-        __bang_mul(nram_output, nram_input, nram_output, aligned_len);
-        __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
+        for (int i = 0; i < len; i+=8){
+            if (nram_input[i] < 0)
+                nram_temp[i] *= negative_slope;
+            if (nram_input[i+1] < 0)
+                nram_temp[i+1] *= negative_slope;
+            if (nram_input[i+2] < 0)
+                nram_temp[i+2] *= negative_slope;
+            if (nram_input[i+3] < 0)
+                nram_temp[i+3] *= negative_slope;
+            if (nram_input[i+4] < 0)
+                nram_temp[i+4] *= negative_slope;
+            if (nram_input[i+5] < 0)
+                nram_temp[i+5] *= negative_slope;
+            if (nram_input[i+6] < 0)
+                nram_temp[i+6] *= negative_slope;
+            if (nram_input[i+7] < 0)
+                nram_temp[i+7] *= negative_slope;
+        }
+        __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
