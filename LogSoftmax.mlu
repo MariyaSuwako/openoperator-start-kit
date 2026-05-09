@@ -28,7 +28,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         half avg = nram_sum[0] / aligned_len;
         __bang_sub_scalar(nram_input, nram_input, avg, aligned_len);
         __bang_active_exp(nram_output, nram_input, aligned_len);
-        __bang_reduce_sum(nram_sum, nram_input, aligned_len);
+        __bang_reduce_sum(nram_sum, nram_output, aligned_len);
         __bang_reduce_sum(nram_sum, nram_sum, aligned_len);
         half sum = log(nram_sum[0]);
         __bang_sub_scalar(nram_output, nram_input, sum, aligned_len);
