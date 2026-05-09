@@ -5,7 +5,7 @@
 
 #define CHUNK_SIZE 32768
 
-__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total) {
+__mlu_entry__ void leakyrelu_kernel(double *input, double *output, int total) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -15,22 +15,22 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ half nram_input[CHUNK_SIZE];
-    __nram__ half nram_sum[CHUNK_SIZE];
-    __nram__ half nram_output[CHUNK_SIZE];
+    __nram__ double nram_input[CHUNK_SIZE];
+    __nram__ double nram_sum[CHUNK_SIZE];
+    __nram__ double nram_output[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
-        __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
+        __memcpy(nram_input, input + start + offset, len * sizeof(double), GDRAM2NRAM);
         __bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1);
-        half maximum = nram_sum[0];
+        double maximum = nram_sum[0];
         __bang_sub_scalar(nram_input, nram_input, maximum, len);
         __bang_active_exp(nram_output, nram_input, len);
         __bang_sumpool(nram_sum, nram_output, 1, len, 1, len, 1);
-        half sum = log(nram_sum[0]);
+        double sum = log(nram_sum[0]);
         __bang_sub_scalar(nram_output, nram_input, sum, len);
-        __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
+        __memcpy(output + start + offset, nram_output, len * sizeof(double), NRAM2GDRAM);
     }
 }
 
