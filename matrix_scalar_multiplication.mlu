@@ -31,7 +31,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
 torch::Tensor bang_func(torch::Tensor A, double s) {
     TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
 
-    auto output = torch::empty_like(input);
+    auto output = torch::empty_like(A);
     int total = A.numel();
 
     // 获取 MLU 队列
