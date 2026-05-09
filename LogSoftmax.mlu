@@ -5,6 +5,10 @@
 
 #define CHUNK_SIZE 32768
 
+half __bang_sum (__nram__ half *A, int len) {
+    return A[len - 1];
+}
+
 __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total) {
     // 多核拆分参数
     uint32_t core_id = taskId;
@@ -24,7 +28,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
         half avg = __bang_sum(nram_input, aligned_len) / aligned_len;
         __bang_sub_scalar(nram_input, nram_input, avg, aligned_len);
-        __bang_active_exp(nram_output, nram_input, avg, aligned_len);
+        __bang_active_exp(nram_output, nram_input, aligned_len);
         half sum = log(__bang_sum(nram_output, aligned_len));
         __bang_sub_scalar(nram_output, nram_input, sum, aligned_len);
         __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
@@ -33,13 +37,10 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
 
 torch::Tensor bang_func(torch::Tensor A, int dim) {
     TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
-    int batch_size = A.size()[0];
     auto B = torch::empty_like(A);
     int total = A.numel();
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {batch_size, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    leakyrelu_kernel<<<dim, ktype, queue>>>(
+    cnrtDim3_t dim = {total/dim, 1, 1};
+    leakyrelu_kernel<<<(cnrtDim3_t){total/dim, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
         B.data_ptr<c10::Half>(),
         total
