@@ -5,7 +5,7 @@
 
 #define CHUNK_SIZE 32768
 
-__mlu_entry__ void leakyrelu_kernel(double *input, double *output, int total) {
+__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -15,36 +15,36 @@ __mlu_entry__ void leakyrelu_kernel(double *input, double *output, int total) {
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ double nram_input[CHUNK_SIZE];
-    __nram__ double nram_sum[CHUNK_SIZE];
-    __nram__ double nram_output[CHUNK_SIZE];
+    __nram__ float nram_input[CHUNK_SIZE];
+    __nram__ float nram_sum[CHUNK_SIZE];
+    __nram__ float nram_output[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
-        __memcpy(nram_input, input + start + offset, len * sizeof(double), GDRAM2NRAM);
+        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
         __bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1);
-        double maximum = nram_sum[0];
+        float maximum = nram_sum[0];
         __bang_sub_scalar(nram_input, nram_input, maximum, len);
         __bang_active_exp(nram_output, nram_input, len);
         __bang_sumpool(nram_sum, nram_output, 1, len, 1, len, 1);
-        double sum = log(nram_sum[0]);
+        float sum = log(nram_sum[0]);
         __bang_sub_scalar(nram_output, nram_input, sum, len);
-        __memcpy(output + start + offset, nram_output, len * sizeof(double), NRAM2GDRAM);
+        __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor A, int dim) {
     TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
-    A = A.type(torch::kFloat64)
+    A = A.type(torch::kFloat32)
     auto B = torch::empty_like(A);
     int total = A.numel();
     unsigned int batch = total/dim;
     leakyrelu_kernel<<<(cnrtDim3_t){batch, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
-        A.data_ptr<double>(),
-        B.data_ptr<double>(),
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
         total
     );
 
     return B.type(torch::kFloat16);
-}//abc
+}
