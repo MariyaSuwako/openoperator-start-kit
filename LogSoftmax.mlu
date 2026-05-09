@@ -5,10 +5,10 @@
 
 #define CHUNK_SIZE 32768
 
-__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total,int taskId,int taskDim) {
+__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total,int a,int b) {
     // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    uint32_t core_id = a;
+    uint32_t core_num = b;
     uint32_t per_core = total / core_num;
     uint32_t remainder = total % core_num;
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
@@ -40,7 +40,7 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
     int total = A.numel();
     unsigned int batch = total/dim;
     for (int i=0;i<batch;i++)
-    leakyrelu_kernel(A.data_ptr<c10::Half>(),B.data_ptr<c10::Half>(),total,i,batch);
+    leakyrelu_kernel(A.data_ptr<c10::Half>(),B.data_ptr<c10::Half>(),total,i,total/dim);
     /*
     leakyrelu_kernel<<<(cnrtDim3_t){batch, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
