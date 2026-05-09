@@ -1,10 +1,11 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <math.h>
 
 #define CHUNK_SIZE 32768
 
-__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total, float s) {
+__mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -15,39 +16,34 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
 
     // NRAM 空间分配
     __nram__ half nram_input[CHUNK_SIZE];
+    __nram__ half nram_output[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-        // Bang C 向量指令要求长度对齐到 64 个 float (256 字节)
         uint32_t aligned_len = (len + 63) & ~63;
-
-        // 从 GDRAM 加载数据到 NRAM
         __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
-        __bang_mul_scalar(nram_input, nram_input, s, aligned_len);
-        __memcpy(output + start + offset, nram_input, len * sizeof(half), NRAM2GDRAM);
+        half avg = __bang_sum(nram_input, aligned_len) / aligned_len;
+        __bang_sub_scalar(nram_input, nram_input, avg, aligned_len);
+        __bang_active_exp(nram_output, nram_input, avg, aligned_len);
+        half sum = log(__bang_sum(nram_output, aligned_len));
+        __bang_sub_scalar(nram_output, nram_input, sum, aligned_len);
+        __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
     }
 }
 
-torch::Tensor bang_func(torch::Tensor A, double s) {
+torch::Tensor bang_func(torch::Tensor A, int dim) {
     TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
-
-    auto output = torch::empty_like(A);
+    int batch_size = A.size()[0];
+    auto B = torch::empty_like(A);
     int total = A.numel();
-
-    // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 配置任务维度（使用 64 个 core）
-    cnrtDim3_t dim = {64, 1, 1};
+    cnrtDim3_t dim = {batch_size, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    // 启动 kernel
     leakyrelu_kernel<<<dim, ktype, queue>>>(
         A.data_ptr<c10::Half>(),
-        output.data_ptr<c10::Half>(),
-        total,
-        s
+        B.data_ptr<c10::Half>(),
+        total
     );
 
-    return output;
+    return B;
 }//abc
