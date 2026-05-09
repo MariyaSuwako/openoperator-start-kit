@@ -27,7 +27,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         __bang_sumpool(nram_sum, nram_input, 1, len, 1, len, 1);
         half sum = nram_sum[0];
         __bang_mul_scalar(nram_output, nram_input, 1.0 / sum, len);
-        __bang_log(nram_output, nram_output, len);
+        __bang_active_log(nram_output, nram_output, len);
         __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
     }
 }
