@@ -23,11 +23,11 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
         __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-        __bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1);
+        __bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1, 1, 1);
         float maximum = nram_sum[0];
         __bang_sub_scalar(nram_input, nram_input, maximum, len);
         __bang_active_exp(nram_output, nram_input, len);
-        __bang_sumpool(nram_sum, nram_output, 1, len, 1, len, 1);
+        __bang_sumpool(nram_sum, nram_output, 1, len, 1, len, 1, 1, 1);
         float sum = log(nram_sum[0]);
         __bang_sub_scalar(nram_output, nram_input, sum, len);
         __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
