@@ -23,14 +23,14 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
         __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
-        int maximum=nram_input[0];
+        half maximum=nram_input[0];
         for (int i=0;i<len;i++)
         maximum=maximum>nram_input[i]?maximum:nram_input[i];
         __bang_sub_scalar(nram_input, nram_input, maximum, len);
         __bang_active_exp(nram_output, nram_input, len);
-        int sum=0;
+        half sum=0;
         for (int i=0;i<len;i++)
-        sum+=nram_input[i];
+        sum+=nram_output[i];
         __bang_sub_scalar(nram_output, nram_input, sum, len);
         __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
     }
