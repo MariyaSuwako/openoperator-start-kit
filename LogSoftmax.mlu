@@ -17,6 +17,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total) {
     // NRAM 空间分配
     __nram__ float nram_input[CHUNK_SIZE];
     __nram__ float nram_one[CHUNK_SIZE];
+    __wram__ float wram_one[CHUNK_SIZE];
     __nram__ float nram_sum[CHUNK_SIZE];
     __nram__ float nram_output[CHUNK_SIZE];
 
@@ -26,7 +27,8 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total) {
         __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
         __bang_active_exp(nram_input, nram_input, len);
         __bang_write_value(nram_one, len, 1.0);
-        __bang_matmul(nram_sum, nram_input, nram_one, 1, len, 1);
+        __memcpy(wram_one, nram_one, len * sizeof(float), GDRAM2NRAM);
+        __bang_matmul(nram_sum, nram_input, wram_one, 1, len, 1);
         __bang_sub_scalar(nram_output, nram_input, (float)log((double)nram_sum[0]), len);
         __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
     }
