@@ -23,13 +23,13 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
         __memcpy(nram_input, input + start + offset, len * sizeof(c10::Half), GDRAM2NRAM);
-        __bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1);
-        half maximum = nram_sum[0];
-        __bang_sub_scalar(nram_input, nram_input, maximum, len);
+        //__bang_maxpool(nram_sum, nram_input, 1, len, 1, len, 1);
+        //half maximum = nram_sum[0];
+        //__bang_sub_scalar(nram_input, nram_input, maximum, len);
         __bang_active_exp(nram_output, nram_input, len);
         __bang_sumpool(nram_sum, nram_output, 1, len, 1, len, 1);
         half sum = log(nram_sum[0]);
-        __bang_sub_scalar(nram_output, nram_input, sum, len);
+        __bang_mul_scalar(nram_output, nram_output, 1.0/sum, len);
         __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
     }
 }
@@ -39,7 +39,7 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
     auto B = torch::empty_like(A);
     int total = A.numel();
     unsigned int temp = A.sizes()[0];
-    leakyrelu_kernel<<<(cnrtDim3_t){4, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
+    leakyrelu_kernel<<<(cnrtDim3_t){16, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
         B.data_ptr<c10::Half>(),
         total
