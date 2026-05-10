@@ -7,8 +7,8 @@
 
 __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total) {
     // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    uint32_t core_id = 0;
+    uint32_t core_num = 1;
     uint32_t per_core = total / core_num;
     uint32_t remainder = total % core_num;
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
@@ -39,7 +39,6 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
     auto B = torch::empty_like(A);
     int total = A.numel();
     unsigned int temp = A.sizes()[0];
-    int abc = 0;
     leakyrelu_kernel<<<(cnrtDim3_t){1, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
         B.data_ptr<c10::Half>(),
