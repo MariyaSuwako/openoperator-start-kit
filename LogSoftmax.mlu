@@ -13,6 +13,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int tot
     uint32_t remainder = total % core_num;
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    while (count!=16384||per_core!=16384||remainder);
 
     // NRAM 空间分配
     __nram__ half nram_input[CHUNK_SIZE];
@@ -39,7 +40,6 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
     auto B = torch::empty_like(A);
     int total = A.numel();
     unsigned int temp = A.sizes()[0];
-    int abc = 0;
     leakyrelu_kernel<<<(cnrtDim3_t){temp, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
         B.data_ptr<c10::Half>(),
