@@ -36,6 +36,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total) {
 
 torch::Tensor bang_func(torch::Tensor A, int dim) {
     TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
+    A = A.to(torch::kFloat32);
     auto B = torch::empty_like(A);
     int total = A.numel();
     unsigned int temp = A.sizes()[0];
@@ -44,5 +45,5 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
         B.data_ptr<float>(),
         total
     );
-    return B;
+    return B.to(torch::kFloat16);
 }//abc
