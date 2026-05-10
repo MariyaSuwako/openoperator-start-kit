@@ -3,7 +3,7 @@
 #include <cnrt.h>
 #include <math.h>
 
-#define CHUNK_SIZE 32768
+#define CHUNK_SIZE 16384
 
 __mlu_entry__ void leakyrelu_kernel(c10::Half *input, c10::Half *output, int total, int abc) {
     // 多核拆分参数
@@ -40,11 +40,11 @@ torch::Tensor bang_func(torch::Tensor A, int dim) {
     int total = A.numel();
     unsigned int temp = A.sizes()[0];
     int abc = 0;
-    leakyrelu_kernel<<<(cnrtDim3_t){temp, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
+    leakyrelu_kernel<<<(cnrtDim3_t){4, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<c10::Half>(),
         B.data_ptr<c10::Half>(),
         total,abc
     );
-    while (abc<136);
+    while (abc<10);
     return B;
 }//abc
