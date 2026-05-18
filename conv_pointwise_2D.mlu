@@ -1,0 +1,114 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+// 前向声明
+__mlu_entry__ void pointwise_conv2d_kernel(
+    float *x, float *weight, float *bias, float *output,
+    int N, int C, int OC, int H, int W);
+
+// ---------- 包装函数 ----------
+torch::Tensor bang_func(torch::Tensor x,
+                        torch::Tensor kernel,
+                        int in_channels,
+                        int out_channels,
+                        bool bias) {
+    // 连续化并转为 float32
+    auto x_contig    = x.contiguous().to(torch::kFloat32);
+    auto k_contig    = kernel.contiguous().to(torch::kFloat32);
+
+    // 维度校验
+    TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D (N, C, H, W)");
+    TORCH_CHECK(k_contig.dim() == 4, "kernel must be 4-D (OC, C, 1, 1)");
+
+    const int N  = x_contig.size(0);
+    const int C  = x_contig.size(1);
+    const int H  = x_contig.size(2);
+    const int W  = x_contig.size(3);
+    const int OC = k_contig.size(0);
+
+    TORCH_CHECK(C  == in_channels,  "in_channels mismatch");
+    TORCH_CHECK(OC == out_channels, "out_channels mismatch");
+    TORCH_CHECK(k_contig.size(1) == C &&
+                k_contig.size(2) == 1 &&
+                k_contig.size(3) == 1,
+                "kernel must be [OC, C, 1, 1]");
+
+    auto output = torch::empty({N, OC, H, W}, x_contig.options());
+
+    // 偏置准备
+    torch::Tensor bias_tensor;
+    float *bias_ptr = nullptr;
+    if (bias) {
+        bias_tensor = torch::zeros({OC}, x_contig.options());
+        bias_ptr = bias_tensor.data_ptr<float>();
+    }
+
+    // 启动核函数
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {16, 1, 1};
+
+    pointwise_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        N, C, OC, H, W
+    );
+    cnrtQueueSync(queue);
+
+    return output;
+}
+
+// ---------- 逐点卷积核函数 ----------
+__mlu_entry__ void pointwise_conv2d_kernel(
+    float *x, float *weight, float *bias, float *output,
+    int N, int C, int OC, int H, int W) {
+
+    uint32_t total_outs = (uint32_t)N * OC * H * W;
+    uint32_t core_id    = taskId;
+    uint32_t core_num   = taskDim;
+    uint32_t per_core   = total_outs / core_num;
+    uint32_t remainder  = total_outs % core_num;
+    uint32_t start      = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count      = per_core + (core_id < remainder ? 1 : 0);
+
+    // NRAM 变量（单元素必须显式声明为 __nram__）
+    __nram__ float x_val;
+    __nram__ float w_val;
+    __nram__ float accum;
+    __nram__ float b_val;
+
+    // 遍历分配给该核的所有输出元素
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        // 线性索引解码为 (n, oc, h, w)
+        int tmp = (int)idx;
+        int w   = tmp % W;     tmp /= W;
+        int h   = tmp % H;     tmp /= H;
+        int oc  = tmp % OC;    tmp /= OC;
+        int n   = tmp;
+
+        accum = 0.0f;
+
+        // 通道方向点积
+        for (int ic = 0; ic < C; ++ic) {
+            // 加载 x[n, ic, h, w]
+            int x_off = ((n * C + ic) * H + h) * W + w;
+            __memcpy(&x_val, x + x_off, sizeof(float), GDRAM2NRAM);
+
+            // 加载 weight[oc, ic]
+            __memcpy(&w_val, weight + oc * C + ic, sizeof(float), GDRAM2NRAM);
+
+            accum += x_val * w_val;
+        }
+
+        // 加上偏置（如果存在）
+        if (bias != nullptr) {
+            __memcpy(&b_val, bias + oc, sizeof(float), GDRAM2NRAM);
+            accum += b_val;
+        }
+
+        // 写回全局内存
+        __memcpy(output + idx, &accum, sizeof(float), NRAM2GDRAM);
+    }
+}
