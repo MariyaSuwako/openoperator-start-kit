@@ -3,9 +3,7 @@
 #include <cnrt.h>
 #include <algorithm>
 
-// 深度卷积核的最大对齐尺寸（K*K 向上取整到 32 的倍数）
 #define MAX_K2_ALIGNED 1024
-// 点卷积分块计算的大小
 #define PW_CHUNK_SIZE  256
 
 // ---------- 前向声明 ----------
@@ -29,12 +27,10 @@ torch::Tensor bang_func(torch::Tensor x,
                         int stride,
                         int padding,
                         int dilation) {
-    // 连续化并转为 float32
     auto x_contig      = x.contiguous().to(torch::kFloat32);
     auto dw_contig     = depthwise_kernel.contiguous().to(torch::kFloat32);
     auto pw_contig     = pointwise_kernel.contiguous().to(torch::kFloat32);
 
-    // 维度校验
     TORCH_CHECK(x_contig.dim() == 4,          "x must be 4-D (N, C, H, W)");
     TORCH_CHECK(dw_contig.dim() == 4,         "depthwise_kernel must be 4-D (C, 1, K, K)");
     TORCH_CHECK(pw_contig.dim() == 4,         "pointwise_kernel must be 4-D (OC, C, 1, 1)");
@@ -43,33 +39,28 @@ torch::Tensor bang_func(torch::Tensor x,
     const int C = x_contig.size(1);
     const int H = x_contig.size(2);
     const int W = x_contig.size(3);
-    const int K = dw_contig.size(2);          // 实际 kernel size
-    const int OC = pw_contig.size(0);         // 输出通道数
+    const int K = dw_contig.size(2);
+    const int OC = pw_contig.size(0);
 
-    TORCH_CHECK(C == in_channels,            "in_channels mismatch with x.shape[1]");
-    TORCH_CHECK(K == kernel_size,            "kernel_size mismatch with depthwise_kernel.shape[2]");
+    TORCH_CHECK(C == in_channels,            "in_channels mismatch");
+    TORCH_CHECK(K == kernel_size,            "kernel_size mismatch");
     TORCH_CHECK(dw_contig.size(0) == C && dw_contig.size(1) == 1,
                 "depthwise_kernel must be [C, 1, K, K]");
     TORCH_CHECK(pw_contig.size(1) == C && pw_contig.size(2) == 1 && pw_contig.size(3) == 1,
                 "pointwise_kernel must be [OC, C, 1, 1]");
-    TORCH_CHECK(OC == out_channels,          "out_channels mismatch with pointwise_kernel.shape[0]");
+    TORCH_CHECK(OC == out_channels,          "out_channels mismatch");
 
-    // 计算输出尺寸（考虑 dilation）
     int effective_K = dilation * (K - 1) + 1;
     int H_out = (H + 2 * padding - effective_K) / stride + 1;
     int W_out = (W + 2 * padding - effective_K) / stride + 1;
     TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
 
-    // 分配中间张量 [N, C, H_out, W_out]（深度卷积输出）
     auto dw_output = torch::empty({N, C, H_out, W_out}, x_contig.options());
-    // 分配最终输出 [N, OC, H_out, W_out]
     auto output = torch::empty({N, OC, H_out, W_out}, x_contig.options());
 
-    // 获取 MLU 流
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_dim = {16, 1, 1};
 
-    // 第一步：深度卷积
     depthwise_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         x_contig.data_ptr<float>(),
         dw_contig.data_ptr<float>(),
@@ -79,7 +70,6 @@ torch::Tensor bang_func(torch::Tensor x,
         K, stride, padding, dilation,
         H_out, W_out
     );
-    // 第二步：逐点卷积（1x1）
     pointwise_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         dw_output.data_ptr<float>(),
         pw_contig.data_ptr<float>(),
@@ -127,7 +117,6 @@ __mlu_entry__ void depthwise_conv2d_kernel(
         int h_start = (int)oh * stride - padding;
         int w_start = (int)ow * stride - padding;
 
-        // 加载输入窗口（带 dilation，边界外填零）
         __bang_write_zero(input_win, aligned_K2);
         for (int kh = 0; kh < K; ++kh) {
             int in_h = h_start + kh * dilation;
@@ -140,13 +129,11 @@ __mlu_entry__ void depthwise_conv2d_kernel(
             }
         }
 
-        // 加载当前通道卷积核
         __memcpy(weight_k, weight + c * K2, K2 * sizeof(float), GDRAM2NRAM);
         if (aligned_K2 > K2) {
             __bang_write_zero(weight_k + K2, aligned_K2 - K2);
         }
 
-        // 点积 + 归约
         __bang_mul(temp_mul, input_win, weight_k, aligned_K2);
         __bang_reduce_sum(sum_buf, temp_mul, aligned_K2);
         result = sum_buf[0];
@@ -160,7 +147,7 @@ __mlu_entry__ void depthwise_conv2d_kernel(
     }
 }
 
-// ---------- 逐点卷积核函数（1×1，无偏置） ----------
+// ---------- 逐点卷积核函数（1×1） ----------
 __mlu_entry__ void pointwise_conv2d_kernel(
     float *x, float *weight, float *bias, float *output,
     int N, int C, int OC, int H_out, int W_out) {
@@ -177,6 +164,7 @@ __mlu_entry__ void pointwise_conv2d_kernel(
     __nram__ float w_buf[PW_CHUNK_SIZE];
     __nram__ float mul_buf[PW_CHUNK_SIZE];
     __nram__ float sum_buf[PW_CHUNK_SIZE];
+    __nram__ float accum;      // 修复：必须为 __nram__
     __nram__ float b_val;
 
     for (uint32_t idx = start; idx < start + count; ++idx) {
@@ -186,23 +174,15 @@ __mlu_entry__ void pointwise_conv2d_kernel(
         int oc  = tmp % OC;     tmp /= OC;
         int n   = tmp;
 
-        float accum = 0.0f;
+        accum = 0.0f;
 
-        // 分块计算内积 Σ_{ic} x[n, ic, oh, ow] * weight[oc, ic]
         for (int ic = 0; ic < C; ic += PW_CHUNK_SIZE) {
             int len = (ic + PW_CHUNK_SIZE <= C) ? PW_CHUNK_SIZE : (C - ic);
 
-            // 加载输入值（同一空间位置不同通道）
             int x_base = ((n * C + ic) * H_out + oh) * W_out + ow;
             __memcpy(in_buf, x + x_base, len * sizeof(float), GDRAM2NRAM);
-
-            // 加载对应权重（输出通道 oc 对应的权重段）
             __memcpy(w_buf, weight + oc * C + ic, len * sizeof(float), GDRAM2NRAM);
-
-            // 逐元素乘法
             __bang_mul(mul_buf, in_buf, w_buf, len);
-
-            // 归约求和（结果放在 sum_buf[0]）
             __bang_reduce_sum(sum_buf, mul_buf, len);
             accum += sum_buf[0];
         }
@@ -212,7 +192,6 @@ __mlu_entry__ void pointwise_conv2d_kernel(
             accum += b_val;
         }
 
-        // 写回
         __memcpy(output + idx, &accum, sizeof(float), NRAM2GDRAM);
     }
 }
