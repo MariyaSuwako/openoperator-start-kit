@@ -56,11 +56,12 @@ torch::Tensor bang_func(torch::Tensor x,
     TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
 
     auto dw_output = torch::empty({N, C, H_out, W_out}, x_contig.options());
-    auto output = torch::empty({N, OC, H_out, W_out}, x_contig.options());
+    auto output    = torch::empty({N, OC, H_out, W_out}, x_contig.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_dim = {16, 1, 1};
 
+    // 第一步：深度卷积
     depthwise_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         x_contig.data_ptr<float>(),
         dw_contig.data_ptr<float>(),
@@ -70,6 +71,7 @@ torch::Tensor bang_func(torch::Tensor x,
         K, stride, padding, dilation,
         H_out, W_out
     );
+    // 第二步：逐点卷积（1×1）
     pointwise_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         dw_output.data_ptr<float>(),
         pw_contig.data_ptr<float>(),
@@ -147,7 +149,7 @@ __mlu_entry__ void depthwise_conv2d_kernel(
     }
 }
 
-// ---------- 逐点卷积核函数（1×1） ----------
+// ---------- 逐点卷积核函数（1×1，修正对齐） ----------
 __mlu_entry__ void pointwise_conv2d_kernel(
     float *x, float *weight, float *bias, float *output,
     int N, int C, int OC, int H_out, int W_out) {
@@ -164,7 +166,7 @@ __mlu_entry__ void pointwise_conv2d_kernel(
     __nram__ float w_buf[PW_CHUNK_SIZE];
     __nram__ float mul_buf[PW_CHUNK_SIZE];
     __nram__ float sum_buf[PW_CHUNK_SIZE];
-    __nram__ float accum;      // 修复：必须为 __nram__
+    __nram__ float accum;
     __nram__ float b_val;
 
     for (uint32_t idx = start; idx < start + count; ++idx) {
@@ -176,14 +178,24 @@ __mlu_entry__ void pointwise_conv2d_kernel(
 
         accum = 0.0f;
 
+        // 通道分块计算内积
         for (int ic = 0; ic < C; ic += PW_CHUNK_SIZE) {
-            int len = (ic + PW_CHUNK_SIZE <= C) ? PW_CHUNK_SIZE : (C - ic);
+            int len = std::min(PW_CHUNK_SIZE, C - ic);
+            int aligned_len = (len + 31) & ~31;   // 对齐到 32
 
+            // 读入实际数据
             int x_base = ((n * C + ic) * H_out + oh) * W_out + ow;
             __memcpy(in_buf, x + x_base, len * sizeof(float), GDRAM2NRAM);
             __memcpy(w_buf, weight + oc * C + ic, len * sizeof(float), GDRAM2NRAM);
-            __bang_mul(mul_buf, in_buf, w_buf, len);
-            __bang_reduce_sum(sum_buf, mul_buf, len);
+
+            // 将剩余部分置零，保证向量操作安全
+            if (aligned_len > len) {
+                __bang_write_zero(in_buf + len, aligned_len - len);
+                __bang_write_zero(w_buf + len, aligned_len - len);
+            }
+
+            __bang_mul(mul_buf, in_buf, w_buf, aligned_len);
+            __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
             accum += sum_buf[0];
         }
 
