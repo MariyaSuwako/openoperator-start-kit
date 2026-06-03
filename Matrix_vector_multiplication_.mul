@@ -63,6 +63,8 @@ __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int M, int K) {
         for (int k_off = 0; k_off < K; k_off += CHUNK_SIZE) {
             int len = (k_off + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k_off);
             int aligned_len = (len + 31) & ~31;    // 向上对齐到 32
+            int a=1,b=1;
+            int c=a+b;
 
             // 从全局内存加载 A 和 B 的当前块
             __memcpy(A_buf, A + i * K + k_off, len * sizeof(float), GDRAM2NRAM);
