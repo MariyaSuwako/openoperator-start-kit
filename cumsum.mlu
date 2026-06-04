@@ -1,0 +1,77 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+// 前向声明
+__mlu_entry__ void cumsum_kernel(
+    float *x, float *y,
+    int D, int inner_size, int outer_size);
+
+// ---------- 包装函数 ----------
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    int ndim = x_contig.dim();
+
+    // 标准化 dim
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "dim out of range");
+
+    auto shape = x_contig.sizes();
+    int D = shape[dim];
+    int outer_size = 1;
+    for (int i = 0; i < dim; ++i) outer_size *= shape[i];
+    int inner_size = 1;
+    for (int i = dim + 1; i < ndim; ++i) inner_size *= shape[i];
+
+    // 输出形状与输入相同
+    auto y = torch::empty_like(x_contig);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {16, 1, 1};
+
+    cumsum_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        y.data_ptr<float>(),
+        D, inner_size, outer_size
+    );
+    cnrtQueueSync(queue);
+
+    return y;
+}
+
+// ---------- 核函数：逐序列标量累加 ----------
+__mlu_entry__ void cumsum_kernel(
+    float *x, float *y,
+    int D, int inner_size, int outer_size) {
+
+    uint32_t total_seqs = (uint32_t)outer_size * inner_size;
+    uint32_t core_id    = taskId;
+    uint32_t core_num   = taskDim;
+    uint32_t per_core   = total_seqs / core_num;
+    uint32_t remainder  = total_seqs % core_num;
+    uint32_t start_seq  = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t seq_count  = per_core + (core_id < remainder ? 1 : 0);
+
+    // NRAM 标量声明（必须）
+    __nram__ float val;
+
+    // 遍历该核负责的序列
+    for (uint32_t seq_idx = start_seq; seq_idx < start_seq + seq_count; ++seq_idx) {
+        int outer = seq_idx / inner_size;
+        int inner = seq_idx % inner_size;
+
+        // 序列基地址：第一个元素在 x 中的偏移
+        int base = outer * D * inner_size + inner;
+
+        float sum = 0.0f;
+        for (int k = 0; k < D; ++k) {
+            int offset = base + k * inner_size;
+            __memcpy(&val, x + offset, sizeof(float), GDRAM2NRAM);
+            sum += val;
+            // 直接写回 y（注意：val 在这里被重用为写入临时值，但写入时需要另一个 __nram__ 变量）
+            // 为避免覆盖，使用直接赋值写入（但 __memcpy 要求 NRAM 源）
+            __nram__ float tmp = sum;
+            __memcpy(y + offset, &tmp, sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
