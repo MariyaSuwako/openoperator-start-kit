@@ -2,9 +2,8 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 256   // 必须为 32 的倍数
+#define CHUNK_SIZE 256   // 分块读取，便于循环
 
-// 前向声明
 __mlu_entry__ void gemv_kernel(
     float *A, float *B, float *C,
     int M, int K);
@@ -37,7 +36,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     return C;
 }
 
-// ---------- GEMV 核函数（修正清零策略） ----------
+// ---------- GEMV 核函数（标量累加，避免向量指令问题） ----------
 __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int M, int K) {
     uint32_t total_rows = (uint32_t)M;
     uint32_t core_id   = taskId;
@@ -49,8 +48,6 @@ __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int M, int K) {
 
     __nram__ float A_buf[CHUNK_SIZE];
     __nram__ float B_buf[CHUNK_SIZE];
-    __nram__ float mul_buf[CHUNK_SIZE];
-    __nram__ float sum_buf[CHUNK_SIZE];
     __nram__ float accum;
 
     for (uint32_t i = start_row; i < start_row + row_count; ++i) {
@@ -59,19 +56,17 @@ __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int M, int K) {
         for (int k_off = 0; k_off < K; k_off += CHUNK_SIZE) {
             int len = (k_off + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k_off);
 
-            // 关键修正：先清零整个缓冲区（对齐到 256），再加载有效数据
-            __bang_write_zero(A_buf, CHUNK_SIZE);
-            __bang_write_zero(B_buf, CHUNK_SIZE);
-
+            // 加载 A 行片段和 B 列片段
             __memcpy(A_buf, A + i * K + k_off, len * sizeof(float), GDRAM2NRAM);
             __memcpy(B_buf, B + k_off,       len * sizeof(float), GDRAM2NRAM);
 
-            // 使用全长度（CHUNK_SIZE）进行向量乘加，尾部自动为零不影响结果
-            __bang_mul(mul_buf, A_buf, B_buf, CHUNK_SIZE);
-            __bang_reduce_sum(sum_buf, mul_buf, CHUNK_SIZE);
-            accum += sum_buf[0];
+            // 标量乘加（安全，无对齐要求）
+            for (int j = 0; j < len; ++j) {
+                accum += A_buf[j] * B_buf[j];
+            }
         }
 
+        // 写回结果
         __memcpy(C + i, &accum, sizeof(float), NRAM2GDRAM);
     }
 }
