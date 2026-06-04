@@ -3,31 +3,27 @@
 #include <cnrt.h>
 #include <cmath>
 
-#define CHUNK_SIZE 256
+#define CHUNK_SIZE 256   // 必须 32 的倍数，用于向量操作
 #define EPS 1e-5f
 
-// 前向声明
 __mlu_entry__ void bn_stats_kernel(
     float *x, float *sum_buf, float *sqsum_buf,
-    int N, int C, int H, int W, int per_channel);
+    int N, int C, int H, int W);
 
 __mlu_entry__ void bn_scale_kernel(
     float *x, float *y, float *mean, float *inv_std,
     float *gamma, float *beta,
     int N, int C, int H, int W);
 
-// ---------- 包装函数 ----------
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
     auto x_contig = x.contiguous().to(torch::kFloat32);
     TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D (N, C, H, W)");
-
     int N = x_contig.size(0);
     int C = x_contig.size(1);
     int H = x_contig.size(2);
     int W = x_contig.size(3);
     TORCH_CHECK(C == num_features, "num_features mismatch");
 
-    int per_channel = N * H * W;
     auto y = torch::empty_like(x_contig);
 
     // 设备端统计缓冲区
@@ -37,40 +33,36 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid16 = {16, 1, 1};
 
-    // 第一步：统计 sum 和 sum_sq
+    // 第一步：正确统计每个通道的 sum 和 sqsum
     bn_stats_kernel<<<grid16, cnrtFuncTypeUnion1, queue>>>(
         x_contig.data_ptr<float>(),
         sum_buf.data_ptr<float>(),
         sqsum_buf.data_ptr<float>(),
-        N, C, H, W, per_channel
+        N, C, H, W
     );
     cnrtQueueSync(queue);
 
-    // 第二步：将统计量拷贝到 CPU 计算 mean 和 inv_std
+    // 第二步：CPU 计算 mean / inv_std
     auto sum_cpu   = sum_buf.to(torch::kCPU);
     auto sqsum_cpu = sqsum_buf.to(torch::kCPU);
     auto sum_a     = sum_cpu.accessor<float, 1>();
     auto sqsum_a   = sqsum_cpu.accessor<float, 1>();
 
-    float inv_n = 1.0f / per_channel;
-    // 在 CPU 上分配 mean 和 inv_std
+    float inv_per_ch = 1.0f / (N * H * W);
     auto mean_cpu    = torch::empty({C}, torch::kFloat32);
     auto inv_std_cpu = torch::empty({C}, torch::kFloat32);
     auto mean_a      = mean_cpu.accessor<float, 1>();
     auto inv_std_a   = inv_std_cpu.accessor<float, 1>();
 
     for (int c = 0; c < C; ++c) {
-        float mu = sum_a[c] * inv_n;
-        float var = sqsum_a[c] * inv_n - mu * mu;
+        float mu = sum_a[c] * inv_per_ch;
+        float var = sqsum_a[c] * inv_per_ch - mu * mu;
         mean_a[c] = mu;
         inv_std_a[c] = 1.0f / sqrtf(var + EPS);
     }
 
-    // 拷回 GPU
     auto mean_t    = mean_cpu.to(x_contig.device());
     auto inv_std_t = inv_std_cpu.to(x_contig.device());
-
-    // gamma = 1, beta = 0
     auto gamma_t = torch::ones({C}, x_contig.options());
     auto beta_t  = torch::zeros({C}, x_contig.options());
 
@@ -85,15 +77,15 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
         N, C, H, W
     );
     cnrtQueueSync(queue);
-
     return y;
 }
 
-// ---------- 统计核（标量累加） ----------
+// ---------- 统计核（修正：按 (n,c) 块连续读取）----------
 __mlu_entry__ void bn_stats_kernel(
     float *x, float *sum_buf, float *sqsum_buf,
-    int N, int C, int H, int W, int per_channel) {
+    int N, int C, int H, int W) {
 
+    int spatial = H * W;
     uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = C / core_num;
@@ -107,15 +99,17 @@ __mlu_entry__ void bn_stats_kernel(
     for (int c = c_start; c < c_end; ++c) {
         ch_sum   = 0.0f;
         ch_sqsum = 0.0f;
-        float *base = x + c * per_channel;
-
-        for (int off = 0; off < per_channel; off += CHUNK_SIZE) {
-            int len = (off + CHUNK_SIZE <= per_channel) ? CHUNK_SIZE : (per_channel - off);
-            __memcpy(in_buf, base + off, len * sizeof(float), GDRAM2NRAM);
-            for (int i = 0; i < len; ++i) {
-                float val = in_buf[i];
-                ch_sum   += val;
-                ch_sqsum += val * val;
+        for (int n = 0; n < N; ++n) {
+            float *base = x + n * C * spatial + c * spatial;  // 连续 spatial 个元素
+            for (int off = 0; off < spatial; off += CHUNK_SIZE) {
+                int len = (off + CHUNK_SIZE <= spatial) ? CHUNK_SIZE : (spatial - off);
+                __memcpy(in_buf, base + off, len * sizeof(float), GDRAM2NRAM);
+                // 标量累加（避免对齐问题）
+                for (int i = 0; i < len; ++i) {
+                    float val = in_buf[i];
+                    ch_sum   += val;
+                    ch_sqsum += val * val;
+                }
             }
         }
         __memcpy(sum_buf + c, &ch_sum, sizeof(float), NRAM2GDRAM);
@@ -123,39 +117,56 @@ __mlu_entry__ void bn_stats_kernel(
     }
 }
 
-// ---------- 标准化核 ----------
+// ---------- 标准化核（按 (n,c) 块向量化处理）----------
 __mlu_entry__ void bn_scale_kernel(
     float *x, float *y, float *mean, float *inv_std,
     float *gamma, float *beta,
     int N, int C, int H, int W) {
 
-    uint32_t total     = (uint32_t)N * C * H * W;
+    int spatial = H * W;
+    // 每个核处理一批 (n, c) 块，按块拆分任务
+    uint32_t total_blocks = (uint32_t)N * C;
     uint32_t core_id   = taskId;
     uint32_t core_num  = taskDim;
-    uint32_t per_core  = total / core_num;
-    uint32_t rem       = total % core_num;
-    uint32_t start     = core_id * per_core + (core_id < rem ? core_id : rem);
-    uint32_t count     = per_core + (core_id < rem ? 1 : 0);
+    uint32_t per_core  = total_blocks / core_num;
+    uint32_t rem       = total_blocks % core_num;
+    uint32_t start_block = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t blocks_count = per_core + (core_id < rem ? 1 : 0);
 
-    // 假设 C ≤ 256，可安全存入 NRAM
-    __nram__ float mean_c[256], inv_std_c[256], gamma_c[256], beta_c[256];
-    __memcpy(mean_c,    mean,    C * sizeof(float), GDRAM2NRAM);
-    __memcpy(inv_std_c, inv_std, C * sizeof(float), GDRAM2NRAM);
-    __memcpy(gamma_c,   gamma,   C * sizeof(float), GDRAM2NRAM);
-    __memcpy(beta_c,    beta,    C * sizeof(float), GDRAM2NRAM);
+    // 预加载 channel 参数到 NRAM（假设 C ≤ 256）
+    __nram__ float mean_arr[256], inv_std_arr[256], gamma_arr[256], beta_arr[256];
+    __memcpy(mean_arr,    mean,    C * sizeof(float), GDRAM2NRAM);
+    __memcpy(inv_std_arr, inv_std, C * sizeof(float), GDRAM2NRAM);
+    __memcpy(gamma_arr,   gamma,   C * sizeof(float), GDRAM2NRAM);
+    __memcpy(beta_arr,    beta,    C * sizeof(float), GDRAM2NRAM);
 
-    __nram__ float x_val, out_val;
+    __nram__ float in_buf[CHUNK_SIZE];
+    __nram__ float out_buf[CHUNK_SIZE];
 
-    for (uint32_t idx = start; idx < start + count; ++idx) {
-        int tmp = (int)idx;
-        int w   = tmp % W; tmp /= W;
-        int h   = tmp % H; tmp /= H;
-        int c   = tmp % C; tmp /= C;
-        int n   = tmp;
+    for (uint32_t idx = start_block; idx < start_block + blocks_count; ++idx) {
+        int n = idx / C;
+        int c = idx % C;
+        float m = mean_arr[c];
+        float istd = inv_std_arr[c];
+        float g = gamma_arr[c];
+        float b = beta_arr[c];
 
-        int x_off = ((n * C + c) * H + h) * W + w;
-        __memcpy(&x_val, x + x_off, sizeof(float), GDRAM2NRAM);
-        out_val = (x_val - mean_c[c]) * inv_std_c[c] * gamma_c[c] + beta_c[c];
-        __memcpy(y + x_off, &out_val, sizeof(float), NRAM2GDRAM);
+        float *x_base = x + n * C * spatial + c * spatial;
+        float *y_base = y + n * C * spatial + c * spatial;
+
+        for (int off = 0; off < spatial; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= spatial) ? CHUNK_SIZE : (spatial - off);
+            int aligned_len = (len + 31) & ~31;   // 对齐到 32
+            __memcpy(in_buf, x_base + off, len * sizeof(float), GDRAM2NRAM);
+            if (aligned_len > len) {
+                __bang_write_zero(in_buf + len, aligned_len - len);
+            }
+            // 向量化计算: out = (in - mean) * inv_std * gamma + beta
+            __bang_sub_scalar(out_buf, in_buf, m, aligned_len);
+            __bang_mul_scalar(out_buf, out_buf, istd, aligned_len);
+            __bang_mul_scalar(out_buf, out_buf, g, aligned_len);
+            __bang_add_scalar(out_buf, out_buf, b, aligned_len);
+            __memcpy(y_base + off, out_buf, len * sizeof(float), NRAM2GDRAM);
+        }
     }
 }
