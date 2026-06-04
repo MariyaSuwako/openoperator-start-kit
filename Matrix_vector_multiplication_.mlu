@@ -11,7 +11,6 @@ __mlu_entry__ void gemv_kernel(
 
 // ---------- 包装函数 ----------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 连续化并转为 float32
     auto A_contig = A.contiguous().to(torch::kFloat32);
     auto B_contig = B.contiguous().to(torch::kFloat32);
 
@@ -26,7 +25,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto C = torch::empty({M, 1}, A_contig.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid_dim = {16, 1, 1};   // 使用 16 个核
+    cnrtDim3_t grid_dim = {16, 1, 1};
 
     gemv_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         A_contig.data_ptr<float>(),
@@ -38,51 +37,41 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     return C;
 }
 
-// ---------- GEMV 核函数 ----------
+// ---------- GEMV 核函数（修正清零策略） ----------
 __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int M, int K) {
     uint32_t total_rows = (uint32_t)M;
-    uint32_t core_id  = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_rows / core_num;
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
+    uint32_t per_core  = total_rows / core_num;
     uint32_t remainder = total_rows % core_num;
     uint32_t start_row = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t row_count  = per_core + (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区（CHUNK_SIZE 保证 32 对齐）
     __nram__ float A_buf[CHUNK_SIZE];
     __nram__ float B_buf[CHUNK_SIZE];
     __nram__ float mul_buf[CHUNK_SIZE];
     __nram__ float sum_buf[CHUNK_SIZE];
     __nram__ float accum;
 
-    // 遍历该核负责的所有行
     for (uint32_t i = start_row; i < start_row + row_count; ++i) {
         accum = 0.0f;
 
-        // 在 K 维上分块进行向量点积
         for (int k_off = 0; k_off < K; k_off += CHUNK_SIZE) {
             int len = (k_off + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k_off);
-            int aligned_len = (len + 31) & ~31;    // 向上对齐到 32
 
-            // 从全局内存加载 A 和 B 的当前块
+            // 关键修正：先清零整个缓冲区（对齐到 256），再加载有效数据
+            __bang_write_zero(A_buf, CHUNK_SIZE);
+            __bang_write_zero(B_buf, CHUNK_SIZE);
+
             __memcpy(A_buf, A + i * K + k_off, len * sizeof(float), GDRAM2NRAM);
-            __memcpy(B_buf, B + k_off,       len * sizeof(float), GDRAM2NRAM); // B 是列向量，连续存储
+            __memcpy(B_buf, B + k_off,       len * sizeof(float), GDRAM2NRAM);
 
-            // 将尾部补零，保证向量操作安全
-            if (aligned_len > len) {
-                __bang_write_zero(A_buf + len, aligned_len - len);
-                __bang_write_zero(B_buf + len, aligned_len - len);
-            }
-
-            // 向量乘 + 归约求和
-            __bang_mul(mul_buf, A_buf, B_buf, aligned_len);
-            __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-
-            // 累加（sum_buf[0] 保存了本次分块的内积）
+            // 使用全长度（CHUNK_SIZE）进行向量乘加，尾部自动为零不影响结果
+            __bang_mul(mul_buf, A_buf, B_buf, CHUNK_SIZE);
+            __bang_reduce_sum(sum_buf, mul_buf, CHUNK_SIZE);
             accum += sum_buf[0];
         }
 
-        // 写回结果（形状 [M,1]）
         __memcpy(C + i, &accum, sizeof(float), NRAM2GDRAM);
     }
 }
