@@ -1,0 +1,99 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>     // for -INFINITY? 但用不到
+
+// 核函数声明
+__mlu_entry__ void argmax_kernel(
+    float *x, int64_t *output,
+    int D, int inner_size, int outer_size);
+
+// ---------- 包装函数 ----------
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    // 转为连续 float32
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    int ndim = x_contig.dim();
+
+    // 标准化 dim
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "dim out of range");
+
+    // 获取形状
+    auto shape = x_contig.sizes();
+    int D = shape[dim];                    // 规约维度长度
+    int outer_size = 1;
+    for (int i = 0; i < dim; ++i) outer_size *= shape[i];
+    int inner_size = 1;
+    for (int i = dim + 1; i < ndim; ++i) inner_size *= shape[i];
+
+    // 构建输出形状（移除 dim 维度）
+    std::vector<int64_t> out_shape;
+    for (int i = 0; i < ndim; ++i) {
+        if (i != dim) out_shape.push_back(shape[i]);
+    }
+
+    // 输出张量，类型 int64（与 PyTorch argmax 一致）
+    auto output = torch::empty(out_shape, x_contig.options().dtype(torch::kInt64));
+
+    // 启动核函数
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {16, 1, 1};
+
+    argmax_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        static_cast<int64_t*>(output.data_ptr()),
+        D, inner_size, outer_size
+    );
+    cnrtQueueSync(queue);
+
+    return output;
+}
+
+// ---------- 核函数 ----------
+__mlu_entry__ void argmax_kernel(
+    float *x, int64_t *output,
+    int D, int inner_size, int outer_size) {
+
+    uint32_t total_outs = (uint32_t)outer_size * inner_size;
+    uint32_t core_id    = taskId;
+    uint32_t core_num   = taskDim;
+    uint32_t per_core   = total_outs / core_num;
+    uint32_t remainder  = total_outs % core_num;
+    uint32_t start      = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count      = per_core + (core_id < remainder ? 1 : 0);
+
+    // 所有用于 __memcpy 的变量必须声明为 __nram__
+    __nram__ float val;
+    __nram__ float max_val;
+    __nram__ int64_t out_val;   // 用于写入的 64 位索引
+
+    // 局部索引用普通 int（无需 NRAM）
+    int max_idx;
+
+    for (uint32_t out_idx = start; out_idx < start + count; ++out_idx) {
+        int outer = out_idx / inner_size;
+        int inner = out_idx % inner_size;
+
+        // dim 维度上切片的基地址（以 float 为单位）
+        int base = outer * D * inner_size + inner;
+
+        // 初始化为第一个元素
+        __memcpy(&val, x + base, sizeof(float), GDRAM2NRAM);
+        max_val = val;
+        max_idx = 0;
+
+        // 遍历剩余元素（逐个标量拷贝）
+        for (int k = 1; k < D; ++k) {
+            int offset = base + k * inner_size;
+            __memcpy(&val, x + offset, sizeof(float), GDRAM2NRAM);
+            if (val > max_val) {
+                max_val = val;
+                max_idx = k;
+            }
+        }
+
+        // 写入结果（int64_t）
+        out_val = static_cast<int64_t>(max_idx);
+        __memcpy(output + out_idx, &out_val, sizeof(int64_t), NRAM2GDRAM);
+    }
+}
