@@ -1,0 +1,105 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 256
+
+// 前向声明
+__mlu_entry__ void gather_kernel(
+    float *x, int *indices, float *weights, float *out,
+    int tokens, int hidden_size, int ne, int top_k);
+
+// ---------- 包装函数 ----------
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor indices,
+    torch::Tensor bin_ids,
+    torch::Tensor weights,
+    torch::Tensor bins,
+    int top_k)
+{
+    // 转为连续内存并统一为 float32 / int32
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    auto indices_contig = indices.contiguous().to(torch::kInt32);
+
+    // 可选权重
+    float* weights_ptr = nullptr;
+    torch::Tensor weights_contig;
+    if (weights.numel() > 0) {
+        weights_contig = weights.contiguous().to(torch::kFloat32);
+        weights_ptr = weights_contig.data_ptr<float>();
+    }
+
+    int tokens = x_contig.size(0);
+    int hidden_size = x_contig.size(1);
+    int ne = indices_contig.numel();
+
+    // 输出形状 (tokens * top_k, hidden_size)
+    auto out = torch::empty({tokens * top_k, hidden_size}, x_contig.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {16, 1, 1};
+
+    gather_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        indices_contig.data_ptr<int>(),
+        weights_ptr,
+        out.data_ptr<float>(),
+        tokens, hidden_size, ne, top_k
+    );
+    cnrtQueueSync(queue);
+
+    return out;
+}
+
+// ---------- 核函数 ----------
+__mlu_entry__ void gather_kernel(
+    float *x, int *indices, float *weights, float *out,
+    int tokens, int hidden_size, int ne, int top_k)
+{
+    uint32_t total = (uint32_t)ne;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t rem = total % core_num;
+    uint32_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t count = per_core + (core_id < rem ? 1 : 0);
+
+    // NRAM 缓冲区（所有参与 __memcpy 的变量必须声明为 __nram__）
+    __nram__ float x_row[CHUNK_SIZE];
+    __nram__ float out_row[CHUNK_SIZE];
+    __nram__ int src_idx;
+    __nram__ float w_val;
+
+    for (uint32_t i = start; i < start + count; ++i) {
+        // 读取 indices[i]
+        __memcpy(&src_idx, indices + i, sizeof(int), GDRAM2NRAM);
+        int src_row = src_idx / top_k;   // floor division
+
+        // 读取权重（若存在）
+        w_val = 1.0f;
+        if (weights != nullptr) {
+            __memcpy(&w_val, weights + src_idx, sizeof(float), GDRAM2NRAM);
+        }
+
+        float *x_src = x + src_row * hidden_size;
+        float *out_dst = out + i * hidden_size;
+
+        // 分块处理 hidden_size 维度
+        for (int off = 0; off < hidden_size; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= hidden_size) ? CHUNK_SIZE : (hidden_size - off);
+            __memcpy(x_row, x_src + off, len * sizeof(float), GDRAM2NRAM);
+
+            if (w_val == 1.0f) {
+                // 无权重，直接拷贝
+                __memcpy(out_dst + off, x_row, len * sizeof(float), NRAM2GDRAM);
+            } else {
+                // 标量乘法（安全，无需对齐）
+                for (int j = 0; j < len; ++j) {
+                    out_row[j] = x_row[j] * w_val;
+                }
+                __memcpy(out_dst + off, out_row, len * sizeof(float), NRAM2GDRAM);
+            }
+        }
+    }
+}
