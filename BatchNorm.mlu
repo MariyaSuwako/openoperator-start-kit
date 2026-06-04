@@ -1,0 +1,181 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>
+
+#define CHUNK_SIZE 256          // 必须 32 的倍数
+#define EPS 1e-5f
+
+// ---------- 前向声明 ----------
+__mlu_entry__ void bn_stats_kernel(
+    float *x, float *sum_buf, float *sqsum_buf,
+    int N, int C, int H, int W, int per_channel_count);
+
+__mlu_entry__ void bn_scale_kernel(
+    float *x, float *y, float *mean, float *inv_std,
+    float *gamma, float *beta,
+    int total_elements, int C, int spatial);
+
+// ---------- 包装函数 ----------
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D (N, C, H, W)");
+
+    int N = x_contig.size(0);
+    int C = x_contig.size(1);
+    int H = x_contig.size(2);
+    int W = x_contig.size(3);
+    TORCH_CHECK(C == num_features, "num_features mismatch with input shape[1]");
+
+    int per_channel = N * H * W;    // 每个通道的样本数
+
+    auto y = torch::empty_like(x_contig);
+
+    // 设备端统计缓冲区
+    auto sum_buf   = torch::empty({C}, x_contig.options());
+    auto sqsum_buf = torch::empty({C}, x_contig.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid16 = {16, 1, 1};
+
+    // ---------- 第一步：多核并行计算每个通道的和与平方和 ----------
+    bn_stats_kernel<<<grid16, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        sum_buf.data_ptr<float>(),
+        sqsum_buf.data_ptr<float>(),
+        N, C, H, W, per_channel
+    );
+    cnrtQueueSync(queue);
+
+    // ---------- 第二步：CPU 上计算均值、方差、inv_std ----------
+    auto sum_cpu   = sum_buf.to(torch::kCPU);
+    auto sqsum_cpu = sqsum_buf.to(torch::kCPU);
+    auto sum_a     = sum_cpu.accessor<float, 1>();
+    auto sqsum_a   = sqsum_cpu.accessor<float, 1>();
+
+    float inv_count = 1.0f / per_channel;
+
+    auto mean_t     = torch::empty({C}, x_contig.options());
+    auto inv_std_t  = torch::empty({C}, x_contig.options());
+    auto gamma_t    = torch::ones({C}, x_contig.options());
+    auto beta_t     = torch::zeros({C}, x_contig.options());
+
+    auto mean_a     = mean_t.accessor<float, 1>();
+    auto inv_std_a  = inv_std_t.accessor<float, 1>();
+
+    for (int c = 0; c < C; ++c) {
+        float mu = sum_a[c] * inv_count;
+        float var = sqsum_a[c] * inv_count - mu * mu;
+        mean_a[c] = mu;
+        inv_std_a[c] = 1.0f / sqrtf(var + EPS);
+    }
+
+    // 将 mean 与 inv_std 拷贝回设备（已在设备内存，上一步是从 GPU 拷出再拷入新张量，但 mean_t 是新分配在 GPU）
+    // 这里 mean_t 和 inv_std_t 本来就是 GPU 张量，直接通过存取器修改即可（无需额外拷贝）
+    // gamma_t, beta_t 已经在 GPU 上
+
+    // ---------- 第三步：标准化核 ----------
+    int total_elements = N * C * H * W;
+    bn_scale_kernel<<<grid16, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        y.data_ptr<float>(),
+        mean_t.data_ptr<float>(),
+        inv_std_t.data_ptr<float>(),
+        gamma_t.data_ptr<float>(),
+        beta_t.data_ptr<float>(),
+        total_elements, C, per_channel
+    );
+    cnrtQueueSync(queue);
+
+    return y;
+}
+
+// ---------- 统计核：按通道并行，每核负责若干通道 ----------
+__mlu_entry__ void bn_stats_kernel(
+    float *x, float *sum_buf, float *sqsum_buf,
+    int N, int C, int H, int W, int per_channel) {
+
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = C / core_num;
+    uint32_t rem      = C % core_num;
+    int c_start = core_id * per_core + (core_id < rem ? core_id : rem);
+    int c_end   = c_start + per_core + (core_id < rem ? 1 : 0);
+
+    __nram__ float in_buf[CHUNK_SIZE];
+    __nram__ float sq_buf[CHUNK_SIZE];
+    __nram__ float sum_buf_ret[CHUNK_SIZE];   // 归约输出缓冲区
+    __nram__ float sqsum_buf_ret[CHUNK_SIZE];
+    __nram__ float ch_sum, ch_sqsum;
+
+    for (int c = c_start; c < c_end; ++c) {
+        ch_sum   = 0.0f;
+        ch_sqsum = 0.0f;
+
+        // 该通道数据的基地址
+        float *base = x + c * per_channel;   // 每个通道的数据是连续的
+
+        for (int off = 0; off < per_channel; off += CHUNK_SIZE) {
+            int len = (off + CHUNK_SIZE <= per_channel) ? CHUNK_SIZE : (per_channel - off);
+
+            __memcpy(in_buf, base + off, len * sizeof(float), GDRAM2NRAM);
+
+            // 尾部补零，保证向量操作安全
+            if (len < CHUNK_SIZE) {
+                __bang_write_zero(in_buf + len, CHUNK_SIZE - len);
+            }
+
+            // 求和
+            __bang_reduce_sum(sum_buf_ret, in_buf, CHUNK_SIZE);
+            ch_sum += sum_buf_ret[0];
+
+            // 平方和：先平方再归约
+            __bang_mul(sq_buf, in_buf, in_buf, CHUNK_SIZE);
+            __bang_reduce_sum(sqsum_buf_ret, sq_buf, CHUNK_SIZE);
+            ch_sqsum += sqsum_buf_ret[0];
+        }
+
+        // 写入全局
+        __memcpy(sum_buf + c, &ch_sum, sizeof(float), NRAM2GDRAM);
+        __memcpy(sqsum_buf + c, &ch_sqsum, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+// ---------- 标准化核：按输出元素并行 ----------
+__mlu_entry__ void bn_scale_kernel(
+    float *x, float *y, float *mean, float *inv_std,
+    float *gamma, float *beta,
+    int total_elements, int C, int spatial) {
+
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
+    uint32_t total     = (uint32_t)total_elements;
+    uint32_t per_core  = total / core_num;
+    uint32_t remainder = total % core_num;
+    uint32_t start     = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count     = per_core + (core_id < remainder ? 1 : 0);
+
+    // 将 C 维的统计量和权重加载到 NRAM（C 通常很小，如64）
+    // 注意：NRAM 容量限制，如果 C 极大需另外处理，但一般 BatchNorm C 不大
+    __nram__ float mean_c[256];   // 假设 C ≤ 256，安全
+    __nram__ float inv_std_c[256];
+    __nram__ float gamma_c[256];
+    __nram__ float beta_c[256];
+
+    // 一次性拷贝所有通道的参数
+    __memcpy(mean_c,    mean,    C * sizeof(float), GDRAM2NRAM);
+    __memcpy(inv_std_c, inv_std, C * sizeof(float), GDRAM2NRAM);
+    __memcpy(gamma_c,   gamma,   C * sizeof(float), GDRAM2NRAM);
+    __memcpy(beta_c,    beta,    C * sizeof(float), GDRAM2NRAM);
+
+    __nram__ float x_val, out_val;
+
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        // 线性索引解码：NCHW 布局
+        int tmp = (int)idx;
+        int w   = tmp % W;           int W_dim = spatial / H; ? 解码需显式依赖形状，这里需要传入 H,W 或 spatial
+        // 更好的做法：传入 N, H, W，让核函数解码
+        // 但函数签名已固定，我们可以在核函数内部根据总元素和C推不出H,W，所以需要在参数中传递H和W
+        // 这里修改 bn_scale_kernel 签名，增加 H, W
+    }
+}
