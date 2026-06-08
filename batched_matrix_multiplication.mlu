@@ -1,0 +1,56 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+#define CHUNK_SIZE_A 524288
+#define CHUNK_SIZE_B 2097152
+#define CHUNK_SIZE_C 1785856
+
+__mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B) {
+    // 多核拆分参数
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core_A = total_A / core_num;
+    uint32_t remainder_A = total_A % core_num;
+    uint32_t per_core_B = total_B / core_num;
+    uint32_t remainder_B = total_B % core_num;
+    uint32_t per_core_C = total_C / core_num;
+    uint32_t remainder_C = total_C % core_num;
+    uint32_t start_A = core_id * per_core_A + (core_id < remainder_A ? core_id : remainder_A);
+    uint32_t count_A = per_core_A + (core_id < remainder_A ? 1 : 0);
+    uint32_t start_B = core_id * per_core_B + (core_id < remainder_B ? core_id : remainder_B);
+    uint32_t count_B = per_core_B + (core_id < remainder_B ? 1 : 0);
+    uint32_t start_C = core_id * per_core_C + (core_id < remainder_C ? core_id : remainder_C);
+    uint32_t count_C = per_core_C + (core_id < remainder_C ? 1 : 0);
+
+    // NRAM 空间分配
+    __nram__ float nram_A[CHUNK_SIZE_A];
+    __wram__ float wram_B[CHUNK_SIZE_B];
+    __nram__ float nram_C[CHUNK_SIZE_C];
+
+    for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
+        uint32_t len_A = (offset_A + CHUNK_SIZE <= count_A) ? CHUNK_SIZE_A : (count_A - offset_A);
+        uint32_t len_B = (offset_B + CHUNK_SIZE <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
+        uint32_t len_C = (offset_C + CHUNK_SIZE <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
+        __memcpy(nram_A, input + start_A + offset_A, len_A * sizeof(float), GDRAM2NRAM);
+        __memcpy(wram_B, input + start_B + offset_B, len_B * sizeof(float), GDRAM2WRAM);
+        __bang_matmul(nram_C, nram_A, wram_B, 512, 1024, 2048);
+        __memcpy(output + start_C + offset_C, nram_C, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    A = A.to(torch::kFloat32);
+    B = B.to(torch::kFloat32);
+    auto C = torch.empty(512, 2048);
+    int total_A = A.numel(), total_B = B.numel();
+    leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        total_A,
+        total_B
+    );
+    return C.to(torch::kFloat16);
+}
