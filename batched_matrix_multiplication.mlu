@@ -7,7 +7,7 @@
 #define CHUNK_SIZE_B 2097152
 #define CHUNK_SIZE_C 1785856
 
-__mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B) {
+__mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B, int total_C) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -38,19 +38,20 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
         __bang_matmul(nram_C, nram_A, wram_B, 512, 1024, 2048);
         __memcpy(output + start_C + offset_C, nram_C, len * sizeof(float), NRAM2GDRAM);
     }
-}///
+}
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     A = A.to(torch::kFloat32);
     B = B.to(torch::kFloat32);
     auto C = torch.empty(512, 2048);
-    int total_A = A.numel(), total_B = B.numel();
+    int total_A = A.numel(), total_B = B.numel(), total_C = B.numel();
     leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<float>(),
         B.data_ptr<float>(),
         C.data_ptr<float>(),
         total_A,
-        total_B
+        total_B,
+        total_C
     );
     return C.to(torch::kFloat16);
 }
