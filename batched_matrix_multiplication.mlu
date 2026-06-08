@@ -16,9 +16,9 @@ __mlu_entry__ void batch_matmul_kernel(half *A, half *B, half *C,
     uint32_t num_batches = batch_per_core + (core_id < remainder ? 1 : 0);
 
     // 2. 为每个核分配片上 NRAM 空间
-    __nram__ half nram_a_row[k];      // 存储 A 矩阵的一整行
-    __nram__ half nram_b_col[k];      // 存储 B 矩阵的一整列
-    __nram__ half nram_tmp[k];        // 存储逐元素乘法的中间结果
+    __nram__ half nram_a_row[CHUNK_SIZE];      // 存储 A 矩阵的一整行
+    __nram__ half nram_b_col[CHUNK_SIZE];      // 存储 B 矩阵的一整列
+    __nram__ half nram_tmp[CHUNK_SIZE];        // 存储逐元素乘法的中间结果
     __nram__ half nram_sum[1];        // 存储最终的 reduce_sum 结果
 
     // 3. 对分配给当前核的每个 batch 进行矩阵乘法
