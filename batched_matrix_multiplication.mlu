@@ -38,7 +38,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
         __bang_matmul(nram_C, nram_A, wram_B, 512, 1024, 2048);
         __memcpy(output + start_C + offset_C, nram_C, len * sizeof(float), NRAM2GDRAM);
     }
-}
+}///
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     A = A.to(torch::kFloat32);
