@@ -25,11 +25,11 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
         {
             for (int j=0;j<1024;j++)
             {
-                __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
+                //__memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
                 __bang_mul_scalar(nram_temp, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
                 __bang_add(nram_output, nram_temp, nram_output, 2048);
             }
-            __memcpy(output, nram_output, 2048 * sizeof(float), NRAM2GDRAM);
+            __memcpy(output + start_C + offset_C + i * 2048, nram_output, 2048 * sizeof(float), NRAM2GDRAM);
         }
     }
 }
