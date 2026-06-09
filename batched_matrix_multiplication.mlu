@@ -7,7 +7,7 @@
 #define CHUNK_SIZE_B 2097152
 #define CHUNK_SIZE_C 1785856
 
-__mlu_entry__ void leakyrelu_kernel(c10::Half *input_A, c10::Half *input_B, c10::Half *output, int total_A, int total_B, int total_C) {
+__mlu_entry__ void leakyrelu_kernel(half *input_A, half *input_B, half *output, int total_A, int total_B, int total_C) {
     // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
