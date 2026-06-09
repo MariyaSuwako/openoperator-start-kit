@@ -10,11 +10,11 @@
 __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B, int total_C) {
     // 多核拆分参数
     uint32_t count_A = 1048576;
-    uint32_t start_A = core_id * count_A;
+    uint32_t start_A = taskId * count_A;
     uint32_t count_B = 4194304;
-    uint32_t start_B = core_id * count_B;
+    uint32_t start_B = taskId * count_B;
     uint32_t count_C = 2097152;
-    uint32_t start_C = core_id * count_C;
+    uint32_t start_C = taskId * count_C;
 
     // NRAM 空间分配
     __nram__ float nram_input[2048];
