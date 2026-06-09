@@ -1,61 +1,93 @@
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
-#include <math.h>
+#include <torch/extension.h>
 
-#define CHUNK_SIZE_A 524288
-#define CHUNK_SIZE_B 2097152
-#define CHUNK_SIZE_C 1785856
+#define CHUNK_SIZE 16384 // 定义块大小，用于分块计算（此实现中暂未使用）
 
-__mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B, int total_C) {
-    // 多核拆分参数
+// MLU 端 kernel 实现
+__mlu_entry__ void batch_matmul_kernel(half *A, half *B, half *C,
+                                       int batch_size, int m, int k, int n) {
+    // 1. 多核任务拆分：按 batch 维度拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core_A = total_A / core_num;
-    uint32_t remainder_A = total_A % core_num;
-    uint32_t per_core_B = total_B / core_num;
-    uint32_t remainder_B = total_B % core_num;
-    uint32_t per_core_C = total_C / core_num;
-    uint32_t remainder_C = total_C % core_num;
-    uint32_t start_A = core_id * per_core_A + (core_id < remainder_A ? core_id : remainder_A);
-    uint32_t count_A = per_core_A + (core_id < remainder_A ? 1 : 0);
-    uint32_t start_B = core_id * per_core_B + (core_id < remainder_B ? core_id : remainder_B);
-    uint32_t count_B = per_core_B + (core_id < remainder_B ? 1 : 0);
-    uint32_t start_C = core_id * per_core_C + (core_id < remainder_C ? core_id : remainder_C);
-    uint32_t count_C = per_core_C + (core_id < remainder_C ? 1 : 0);
+    uint32_t batch_per_core = batch_size / core_num;
+    uint32_t remainder = batch_size % core_num;
+    uint32_t start_batch = core_id * batch_per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t num_batches = batch_per_core + (core_id < remainder ? 1 : 0);
 
-    // NRAM 空间分配
-    __nram__ float nram_input[1024];
-    __nram__ float nram_temp[2048];
-    __nram__ float nram_output[2048];
+    // 2. 为每个核分配片上 NRAM 空间
+    __nram__ half nram_a_row[1024];      // 存储 A 矩阵的一整行
+    __nram__ half nram_b_col[1024];      // 存储 B 矩阵的一整列
+    __nram__ half nram_tmp[1024];        // 存储逐元素乘法的中间结果
+    __nram__ half nram_sum[1];        // 存储最终的 reduce_sum 结果
 
-    for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
-        uint32_t len_A = (offset_A + CHUNK_SIZE_A <= count_A) ? CHUNK_SIZE_A : (count_A - offset_A);
-        uint32_t len_B = (offset_B + CHUNK_SIZE_B <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
-        uint32_t len_C = (offset_C + CHUNK_SIZE_C <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
-        for (int i=0;i<512;i++)
-            for (int j=0;j<1024;j++)
-            {
-                __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
-                __bang_mul_scalar(nram_temp, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
-                __bang_atomic_reduce_add(output + start_C + offset_C + i * 2048, nram_temp, 2048);
+    // 3. 对分配给当前核的每个 batch 进行矩阵乘法
+    for (uint32_t b = 0; b < num_batches; ++b) {
+        uint32_t cur_batch = start_batch + b;
+
+        // 获取当前 batch 在 GDRAM 中的基址
+        half *batch_A = A + cur_batch * m * k;
+        half *batch_B = B + cur_batch * k * n;
+        half *batch_C = C + cur_batch * m * n;
+
+        // 4. 计算当前 batch 的矩阵乘法 C = A * B
+        // 为简化，直接按计算模式编码，未进行深度分块优化
+        for (uint32_t i = 0; i < m; ++i) {
+            // 将 A 矩阵的第 i 行搬运到 nram_a_row
+            __memcpy(nram_a_row, batch_A + i * k, k * sizeof(half), GDRAM2NRAM);
+
+            for (uint32_t j = 0; j < n; ++j) {
+                // 将 B 矩阵的第 j 列搬运到 nram_b_col
+                // 注意：B 矩阵按行主序存储，同一列的元素在内存中不连续，需循环操作
+                for (uint32_t t = 0; t < k; ++t) {
+                    nram_b_col[t] = batch_B[t * n + j];
+                }
+
+                // 5. 向量化计算点积：逐元素相乘，然后求和
+                __bang_mul(nram_tmp, nram_a_row, nram_b_col, k);
+                __bang_reduce_sum(nram_sum, nram_tmp, k);
+
+                // 6. 将结果存回 GDRAM
+                batch_C[i * n + j] = nram_sum[0];
             }
+        }
     }
 }
 
+// Host 端包装函数
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    A = A.to(torch::kFloat32);
-    B = B.to(torch::kFloat32);
-    auto C = torch::empty({512, 2048});
-    C = C.to(torch::kFloat32);
-    int total_A = A.numel(), total_B = B.numel(), total_C = B.numel();
-    leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        C.data_ptr<float>(),
-        total_A,
-        total_B,
-        total_C
+    // 1. 输入合法性检查
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be 3D tensor [batch, m, k]");
+    TORCH_CHECK(B.dim() == 3, "B must be 3D tensor [batch, k, n]");
+    TORCH_CHECK(A.size(0) == B.size(0), "Batch size of A and B must match");
+    TORCH_CHECK(A.size(2) == B.size(1), "k of A and B must match for matrix multiplication");
+
+    // 2. 获取输入维度
+    int batch_size = A.size(0);
+    int m = A.size(1);
+    int k = A.size(2);
+    int n = B.size(2);
+
+    // 3. 创建输出张量
+    auto options = torch::TensorOptions().dtype(A.dtype()).device(A.device());
+    auto C = torch::empty({batch_size, m, n}, options);
+
+    // 4. 获取 MLU 队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 5. 配置任务维度
+    cnrtDim3_t dim = {16, 1, 1};  // 使用 16 个 core，可根据实际情况调整
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    // 6. 启动 kernel
+    batch_matmul_kernel<<<dim, ktype, queue>>>(
+        A.data_ptr<half>(),
+        B.data_ptr<half>(),
+        C.data_ptr<half>(),
+        batch_size, m, k, n
     );
-    return C;
+
+    return C.to(torch::kFloat32);
 }
