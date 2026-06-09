@@ -28,8 +28,11 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
     __nram__ float nram_input[2048];
     __nram__ float nram_temp[2048];
     __nram__ float nram_output[2048];
-
+    int abc=0;
     for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
+        abc++;
+        if (abc==2)
+        return ;
         uint32_t len_A = (offset_A + CHUNK_SIZE_A <= count_A) ? CHUNK_SIZE_A : (count_A - offset_A);
         uint32_t len_B = (offset_B + CHUNK_SIZE_B <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
         uint32_t len_C = (offset_C + CHUNK_SIZE_C <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
