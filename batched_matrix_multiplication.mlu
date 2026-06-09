@@ -34,15 +34,12 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
         uint32_t len_B = (offset_B + CHUNK_SIZE_B <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
         uint32_t len_C = (offset_C + CHUNK_SIZE_C <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
         for (int i=0;i<512;i++)
-        {
             for (int j=0;j<1024;j++)
             {
                 __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
                 __bang_mul_scalar(nram_temp, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
                 __bang_atomic_reduce_add(output + start_C + offset_C + i * 2048, nram_temp, 2048);
             }
-            //__memcpy(output + start_C + offset_C + i * 2048, nram_output, len_C * sizeof(float), NRAM2GDRAM);
-        }
     }
 }
 
@@ -50,6 +47,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     A = A.to(torch::kFloat32);
     B = B.to(torch::kFloat32);
     auto C = torch::empty({512, 2048});
+    C = C.to(torch::kFloat32);
     int total_A = A.numel(), total_B = B.numel(), total_C = B.numel();
     leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<float>(),
@@ -59,5 +57,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         total_B,
         total_C
     );
-    return C.to(torch::kFloat16);
+    return C;
 }
