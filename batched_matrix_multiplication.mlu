@@ -47,5 +47,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         total_B,
         total_C
     );
-    return C;
+    return C.to(torch::kFloat16);
 }
