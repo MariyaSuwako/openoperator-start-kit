@@ -25,7 +25,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
     uint32_t count_C = per_core_C + (core_id < remainder_C ? 1 : 0);
 
     // NRAM 空间分配
-    __nram__ float nram_input[1024];
+    __nram__ float nram_input[2048];
     __nram__ float nram_temp[2048];
     __nram__ float nram_output[2048];
 
