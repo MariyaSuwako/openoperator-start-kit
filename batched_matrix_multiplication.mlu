@@ -9,31 +9,21 @@
 
 __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B, int total_C) {
     // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core_A = total_A / core_num;
-    uint32_t remainder_A = total_A % core_num;
-    uint32_t per_core_B = total_B / core_num;
-    uint32_t remainder_B = total_B % core_num;
-    uint32_t per_core_C = total_C / core_num;
-    uint32_t remainder_C = total_C % core_num;
-    uint32_t start_A = core_id * per_core_A + (core_id < remainder_A ? core_id : remainder_A);
-    uint32_t count_A = per_core_A + (core_id < remainder_A ? 1 : 0);
-    uint32_t start_B = core_id * per_core_B + (core_id < remainder_B ? core_id : remainder_B);
-    uint32_t count_B = per_core_B + (core_id < remainder_B ? 1 : 0);
-    uint32_t start_C = core_id * per_core_C + (core_id < remainder_C ? core_id : remainder_C);
-    uint32_t count_C = per_core_C + (core_id < remainder_C ? 1 : 0);
+    uint32_t count_A = 1048576;
+    uint32_t start_A = core_id * count_A;
+    uint32_t count_B = 4194304;
+    uint32_t start_B = core_id * count_B;
+    uint32_t count_C = 2097152;
+    uint32_t start_C = core_id * count_C;
 
     // NRAM 空间分配
     __nram__ float nram_input[2048];
     __nram__ float nram_temp[2048];
     __nram__ float nram_output[2048];
     for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
-        uint32_t len_A = (offset_A + CHUNK_SIZE_A <= count_A) ? CHUNK_SIZE_A : (count_A - offset_A);
-        uint32_t len_B = (offset_B + CHUNK_SIZE_B <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
-        uint32_t len_C = (offset_C + CHUNK_SIZE_C <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
         for (int i=0;i<512;i++)
         {
+            __memcpy(nram_output, output + start_C + offset_C + i * 2048, 2048 * sizeof(float), GDRAM2NRAM);
             for (int j=0;j<1024;j++)
             {
                 __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
