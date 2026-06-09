@@ -1,51 +1,75 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <math.h>
 
-#define CHUNK_SIZE_A 524288
-#define CHUNK_SIZE_B 2097152
-#define CHUNK_SIZE_C 1048576
+#define M_TILE 128
+#define K_TILE 256
+#define N_TILE 256
 
-__mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *output, int total_A, int total_B, int total_C) {
-    // 多核拆分参数
-    uint32_t count_A = 128 / taskDim * CHUNK_SIZE_A;
-    uint32_t start_A = taskId * count_A;
-    uint32_t count_B = 128 / taskDim * CHUNK_SIZE_B;
-    uint32_t start_B = taskId * count_B;
-    uint32_t count_C = 128 / taskDim * CHUNK_SIZE_C;
-    uint32_t start_C = taskId * count_C;
+__mlu_entry__ void bmm_kernel(
+    half* A,
+    half* B,
+    half* C)
+{
+    int batch = taskId;
 
-    // NRAM 空间分配
-    __nram__ float nram_input[2048];
-    __nram__ float nram_output[2048];
-    for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
-        for (uint32_t i=0;i<512;i++)
+    if(batch >= 128)
+        return;
+
+    A += batch * 512 * 1024;
+    B += batch * 1024 * 2048;
+    C += batch * 512 * 2048;
+
+    __nram__ half A_tile[M_TILE * K_TILE];
+    __nram__ half B_tile[K_TILE * N_TILE];
+
+    __nram__ float C_tile[M_TILE * N_TILE];
+
+    for(int m0 = 0; m0 < 512; m0 += M_TILE)
+    {
+        for(int n0 = 0; n0 < 2048; n0 += N_TILE)
         {
-            __bang_write_zero(nram_output, 2048);
-            for (uint32_t j=0;j<1024;j++)
+            __bang_write_zero(
+                C_tile,
+                M_TILE * N_TILE * sizeof(float));
+
+            for(int k0 = 0; k0 < 1024; k0 += K_TILE)
             {
-                __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
-                __bang_mul_scalar(nram_input, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
-                __bang_add(nram_output, nram_input, nram_output, 2048);
+                for(int i = 0; i < M_TILE; i++)
+                {
+                    __memcpy(
+                        A_tile + i * K_TILE,
+                        A + (m0+i)*1024 + k0,
+                        K_TILE*sizeof(half),
+                        GDRAM2NRAM);
+                }
+
+                for(int i = 0; i < K_TILE; i++)
+                {
+                    __memcpy(
+                        B_tile + i*N_TILE,
+                        B + (k0+i)*2048 + n0,
+                        N_TILE*sizeof(half),
+                        GDRAM2NRAM);
+                }
+
+                __bang_matmul(
+                    C_tile,
+                    A_tile,
+                    B_tile,
+                    M_TILE,
+                    K_TILE,
+                    N_TILE);
             }
-            __memcpy(output + start_C + offset_C + i * 2048, nram_output, 2048 * sizeof(float), NRAM2GDRAM);
+
+            for(int i=0;i<M_TILE;i++)
+            {
+                __memcpy(
+                    C + (m0+i)*2048 + n0,
+                    ((half*)C_tile)+i*N_TILE,
+                    N_TILE*sizeof(half),
+                    NRAM2GDRAM);
+            }
         }
     }
-}
-
-torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    A = A.to(torch::kFloat32);
-    B = B.to(torch::kFloat32);
-    auto C = torch::empty_like(B).narrow(1,0,512);
-    int total_A = A.numel(), total_B = B.numel(), total_C = C.numel();
-    leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        C.data_ptr<float>(),
-        total_A,
-        total_B,
-        total_C
-    );
-    return C.to(torch::kFloat16);
 }
