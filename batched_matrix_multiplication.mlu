@@ -28,11 +28,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
     __nram__ float nram_input[2048];
     __nram__ float nram_temp[2048];
     __nram__ float nram_output[2048];
-    int abc=0;
     for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
-        abc++;
-        if (abc==1)
-        return ;
         uint32_t len_A = (offset_A + CHUNK_SIZE_A <= count_A) ? CHUNK_SIZE_A : (count_A - offset_A);
         uint32_t len_B = (offset_B + CHUNK_SIZE_B <= count_B) ? CHUNK_SIZE_B : (count_B - offset_B);
         uint32_t len_C = (offset_C + CHUNK_SIZE_C <= count_C) ? CHUNK_SIZE_C : (count_C - offset_C);
@@ -41,7 +37,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
             {
                 __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
                 __bang_mul_scalar(nram_temp, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
-                __bang_atomic_reduce_add(output + start_C + offset_C + i * 2048, nram_temp, 2048);
+                //__bang_atomic_reduce_add(output + start_C + offset_C + i * 2048, nram_temp, 2048);
             }
     }
 }
