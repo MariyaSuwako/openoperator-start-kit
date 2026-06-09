@@ -39,9 +39,9 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
             {
                 __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
                 __bang_mul_scalar(nram_temp, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
-                __bang_atomic_reduce_add(nram_output, nram_temp, 2048);
+                __bang_atomic_reduce_add(output + start_C + offset_C + i * 2048, nram_temp, 2048);
             }
-            __memcpy(output + start_C + offset_C + i * 2048, nram_output, len_C * sizeof(float), NRAM2GDRAM);
+            //__memcpy(output + start_C + offset_C + i * 2048, nram_output, len_C * sizeof(float), NRAM2GDRAM);
         }
     }
 }
