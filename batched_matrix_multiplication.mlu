@@ -47,9 +47,9 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto C = torch::empty({512, 2048});
     int total_A = A.numel(), total_B = B.numel(), total_C = B.numel();
     leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
-        A.data_ptr<c10::Half>(),
-        B.data_ptr<c10::Half>(),
-        C.data_ptr<c10::Half>(),
+        A.data_ptr<half>(),
+        B.data_ptr<half>(),
+        C.data_ptr<half>(),
         total_A,
         total_B,
         total_C
