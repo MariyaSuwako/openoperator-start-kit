@@ -17,12 +17,13 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
 
     for (uint32_t i = 0; i < 186; i++)
     {
+        __bang_write_zero(nram_output, 11904);
         for (uint32_t j = 0; j < 11; j++)
         {
             __memcpy(nram_input, input + start_batch_in + i * 11 * 2048 * 64 + j * 2048 * 64, 131072 * sizeof(half), GDRAM2NRAM);
             __bang_sumpool(nram_temp, nram_input, 64, 1, 2048, 1, 11, 1, 11);
-            __bang_mul_scalar(nram_temp, nram_temp, (half)(1.0/121.0), 2048);
-            __bang_add(nram_output, nram_output, nram_temp, 2048);
+            __bang_mul_scalar(nram_temp, nram_temp, (half)(1.0/121.0), 11904);
+            __bang_add(nram_output, nram_output, nram_temp, 11904);
         }
         __memcpy(output + start_batch_out + i * 186 * 64, nram_output, 11904 * sizeof(half), NRAM2GDRAM);
     }
