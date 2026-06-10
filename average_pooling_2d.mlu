@@ -8,8 +8,8 @@
 __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
     uint32_t batch_per_core_in = 16 / taskDim * 64 * 2048 * 2048;
     uint32_t batch_per_core_out = 16 / taskDim * 64 * 186 * 186;
-    uint32_t start_batch_in = taskId * batch_per_core;
-    uint32_t start_batch_out = taskId * batch_per_core;
+    uint32_t start_batch_in = taskId * batch_per_core_in;
+    uint32_t start_batch_out = taskId * batch_per_core_out;
 
     __nram__ half nram_input[1441792];
     __nram__ half nram_output[11904];
@@ -24,11 +24,11 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
 }
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
-    x = x.permute(0, 2, 3, 1);
+    x = x.permute({0, 2, 3, 1});
     auto y = torch::empty({16, 64, 186, 186}, x.options());
     avgpool2d_kernel<<<(cnrtDim3_t){16, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         x.data_ptr<c10::Half>(),
         y.data_ptr<c10::Half>()
     );
-    return y.permute(0, 3, 1, 2);
+    return y.permute({0, 3, 1, 2});
 }
