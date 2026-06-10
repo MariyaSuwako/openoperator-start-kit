@@ -26,14 +26,14 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input_A, c10::Half *input_B, c10:
             for (uint32_t j=0;j<1024;j++)
             {
                 __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(c10::Half), GDRAM2NRAM);
-                __bang_mul_scalar(nram_input, nram_input, (half)*(input_A + start_A + offset_A + i * 1024 + j), 2048);
+                __bang_mul_scalar(nram_input, nram_input, (float)*(input_A + start_A + offset_A + i * 1024 + j), 2048);
                 __bang_add(nram_output, nram_input, nram_output, 2048);
             }
             __memcpy(output + start_C + offset_C + i * 2048, nram_output, 2048 * sizeof(c10::Half), NRAM2GDRAM);
         }
     }
 }
-//
+
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto C = torch::empty_like(B).narrow(1,0,512);
     int total_A = A.numel(), total_B = B.numel(), total_C = C.numel();
