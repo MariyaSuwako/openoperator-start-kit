@@ -2,9 +2,9 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// MLU 核函数：每个核计算一块数据的平方和，结果存入 partial_sums[tid]
-__mlu_entry__ void mse_loss_kernel(const float* pred, const float* target,
-                                   float* partial_sums, int n, int num_cores) {
+// 核函数：每个核计算一块数据的平方和，结果存入 partial_sums[tid]
+__mlu_entry__ void mse_partial_sum_kernel(const float* pred, const float* target,
+                                          float* partial_sums, int n, int num_cores) {
     int tid = taskId;
     if (tid >= num_cores) return;
 
@@ -22,14 +22,12 @@ __mlu_entry__ void mse_loss_kernel(const float* pred, const float* target,
 
 // PyTorch 包装函数
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    // 输入校验
+    // 基本形状检查（不检查设备类型，编译时无 is_mlu）
     TORCH_CHECK(predictions.dim() == 2 && targets.dim() == 2,
                 "Both inputs must be 2D tensors [batch, dim]");
     TORCH_CHECK(predictions.size(0) == targets.size(0) &&
                 predictions.size(1) == targets.size(1),
                 "Input shapes must match");
-    TORCH_CHECK(predictions.device().is_mlu() && targets.device().is_mlu(),
-                "Inputs must be on MLU device");
 
     // 确保连续并转为 float32
     auto pred_contig = predictions.contiguous().to(torch::kFloat32);
@@ -37,18 +35,17 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
 
     int batch = pred_contig.size(0);
     int dim = pred_contig.size(1);
-    int n = batch * dim;                // 总元素数
-    const int num_cores = 64;           // 使用 64 个核（可调整）
+    int n = batch * dim;
+    const int num_cores = 64;               // 并行核数
     TORCH_CHECK(n >= num_cores, "Total elements less than number of cores");
 
-    // 分配存储各核部分和的张量（在 MLU 上）
+    // 在 MLU 上分配部分和数组
     auto partial_sums = torch::empty({num_cores}, pred_contig.options());
 
-    // 配置核函数启动参数
     cnrtDim3_t grid_dim = {static_cast<unsigned int>(num_cores), 1, 1};
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    mse_loss_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+    mse_partial_sum_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         pred_contig.data_ptr<float>(),
         target_contig.data_ptr<float>(),
         partial_sums.data_ptr<float>(),
@@ -57,15 +54,11 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
 
     cnrtQueueSync(queue);
 
-    // 将部分和从 MLU 拷贝到 CPU 进行归约
-    std::vector<float> sums_host(num_cores);
-    cnrtMemcpy(sums_host.data(), partial_sums.data_ptr<float>(),
-               num_cores * sizeof(float), cnrtMemcpyDevToHost);
-
-    float total_sum = 0.0f;
-    for (int i = 0; i < num_cores; ++i) total_sum += sums_host[i];
+    // 在 MLU 上对 partial_sums 求和，然后通过 item() 拷贝到 CPU
+    auto total_sum_tensor = torch::sum(partial_sums);
+    float total_sum = total_sum_tensor.item<float>();
     float mse = total_sum / static_cast<float>(n);
 
-    // 返回标量张量（在 CPU 上，与 PyTorch 常规行为一致）
+    // 返回 CPU 上的标量张量
     return torch::tensor(mse, torch::kFloat32);
 }
