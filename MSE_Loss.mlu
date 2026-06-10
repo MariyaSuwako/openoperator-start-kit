@@ -1,8 +1,9 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <vector>
 
-// 核函数：每个核计算一块数据的平方和，结果存入 partial_sums[tid]
+// 核函数：每个核计算一块数据的平方和，存入 partial_sums[tid]
 __mlu_entry__ void mse_partial_sum_kernel(const float* pred, const float* target,
                                           float* partial_sums, int n, int num_cores) {
     int tid = taskId;
@@ -22,7 +23,7 @@ __mlu_entry__ void mse_partial_sum_kernel(const float* pred, const float* target
 
 // PyTorch 包装函数
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    // 基本形状检查（不检查设备类型，编译时无 is_mlu）
+    // 形状检查
     TORCH_CHECK(predictions.dim() == 2 && targets.dim() == 2,
                 "Both inputs must be 2D tensors [batch, dim]");
     TORCH_CHECK(predictions.size(0) == targets.size(0) &&
@@ -36,7 +37,7 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
     int batch = pred_contig.size(0);
     int dim = pred_contig.size(1);
     int n = batch * dim;
-    const int num_cores = 64;               // 并行核数
+    const int num_cores = 64;           // 使用 64 个核
     TORCH_CHECK(n >= num_cores, "Total elements less than number of cores");
 
     // 在 MLU 上分配部分和数组
@@ -54,9 +55,13 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
 
     cnrtQueueSync(queue);
 
-    // 在 MLU 上对 partial_sums 求和，然后通过 item() 拷贝到 CPU
-    auto total_sum_tensor = torch::sum(partial_sums);
-    float total_sum = total_sum_tensor.item<float>();
+    // 将部分和从 MLU 拷贝到主机（手动归约，不使用 torch::sum）
+    std::vector<float> sums_host(num_cores);
+    cnrtMemcpy(sums_host.data(), partial_sums.data_ptr<float>(),
+               num_cores * sizeof(float), cnrtMemcpyDevToHost);
+
+    float total_sum = 0.0f;
+    for (float s : sums_host) total_sum += s;
     float mse = total_sum / static_cast<float>(n);
 
     // 返回 CPU 上的标量张量
