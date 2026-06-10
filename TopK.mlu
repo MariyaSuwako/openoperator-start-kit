@@ -1,0 +1,85 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define MAX_DIM 2048   // 最大支持的列数
+#define MAX_K   256    // 最大支持的 topk
+
+// 核函数：每个核处理一个 batch 行
+__mlu_entry__ void topk_kernel(const float* x, float* out_vals, int64_t* out_idx,
+                               int batch, int dim, int k) {
+    int row = taskId;   // 当前处理的 batch 索引
+    if (row >= batch) return;
+
+    __nram__ float vals[MAX_DIM];
+    __nram__ int   idxs[MAX_DIM];
+
+    // 1. 加载当前行的所有数据到 NRAM，同时记录原始索引
+    for (int j = 0; j < dim; ++j) {
+        __memcpy(vals + j, x + row * dim + j, sizeof(float), GDRAM2NRAM);
+        idxs[j] = j;
+    }
+
+    // 2. 选择排序（降序），只排序前 k 个位置
+    for (int i = 0; i < k; ++i) {
+        int max_pos = i;
+        float max_val = vals[i];
+        for (int j = i + 1; j < dim; ++j) {
+            if (vals[j] > max_val) {
+                max_val = vals[j];
+                max_pos = j;
+            }
+        }
+        if (max_pos != i) {
+            // 交换值
+            float tmp_val = vals[i];
+            vals[i] = vals[max_pos];
+            vals[max_pos] = tmp_val;
+            // 交换索引
+            int tmp_idx = idxs[i];
+            idxs[i] = idxs[max_pos];
+            idxs[max_pos] = tmp_idx;
+        }
+    }
+
+    // 3. 将前 k 个结果写回全局内存
+    for (int i = 0; i < k; ++i) {
+        __memcpy(out_vals + row * k + i, vals + i, sizeof(float), NRAM2GDRAM);
+        int64_t idx_val = idxs[i];
+        __memcpy(out_idx + row * k + i, &idx_val, sizeof(int64_t), NRAM2GDRAM);
+    }
+}
+
+// PyTorch 包装函数
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    // 输入校验
+    TORCH_CHECK(x.device().is_mlu(), "Input tensor must be on MLU device");
+    TORCH_CHECK(x.dim() == 2, "Only 2D tensor [batch, dim] is supported");
+    TORCH_CHECK(dim == 1, "Only dim=1 is supported (topk along columns)");
+    
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    int batch = x_contig.size(0);
+    int dim_size = x_contig.size(1);
+    
+    TORCH_CHECK(k <= dim_size, "k must be <= dim_size");
+    TORCH_CHECK(k <= MAX_K, "k exceeds MAX_K (", MAX_K, ")");
+    TORCH_CHECK(dim_size <= MAX_DIM, "dim exceeds MAX_DIM (", MAX_DIM, ")");
+    
+    // 分配输出张量
+    auto values = torch::empty({batch, k}, x_contig.options());
+    auto indices = torch::empty({batch, k}, x_contig.options().dtype(torch::kLong));
+    
+    // 配置并行：每个 batch 行一个核
+    cnrtDim3_t grid_dim = {batch, 1, 1};
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    
+    topk_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<float>(),
+        values.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        batch, dim_size, k
+    );
+    
+    cnrtQueueSync(queue);
+    return {values, indices};
+}
