@@ -22,23 +22,14 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
     for (uint32_t offset_A = 0, offset_B = 0, offset_C = 0; offset_A < count_A || offset_B < count_B || offset_C < count_C; offset_A += CHUNK_SIZE_A, offset_B += CHUNK_SIZE_B, offset_C += CHUNK_SIZE_C) {
         for (uint32_t i=0;i<512;i++)
         {
-            for (uint32_t k=0;k<2048;k++)
-            nram_output[k]=0;
+            __bang_write_zero(nram_output, 2048);
             for (uint32_t j=0;j<1024;j++)
             {
-                for (uint32_t k=0;k<2048;k++)
-                nram_input[k]=*(input_B + start_B + offset_B + j * 2048 + k);
-                for (uint32_t k=0;k<2048;k++)
-                nram_input[k]*=*(input_A + start_A + offset_A + i * 1024 + j);
-                for (uint32_t k=0;k<2048;k++)
-                nram_output[k]+=nram_input[k];
-                //__memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
-                //__bang_mul_scalar(nram_input, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
-                //__bang_add(nram_output, nram_input, nram_output, 2048);
+                __memcpy(nram_input, input_B + start_B + offset_B + j * 2048, 2048 * sizeof(float), GDRAM2NRAM);
+                __bang_mul_scalar(nram_input, nram_input, *(input_A + start_A + offset_A + i * 1024 + j), 2048);
+                __bang_add(nram_output, nram_input, nram_output, 2048);
             }
-            for (uint32_t k=0;k<2048;k++)
-            output[k]=nram_output[k];
-            //__memcpy(output + start_C + offset_C + i * 2048, nram_output, 2048 * sizeof(float), NRAM2GDRAM);
+            __memcpy(output + start_C + offset_C + i * 2048, nram_output, 2048 * sizeof(float), NRAM2GDRAM);
         }
     }
 }
@@ -53,5 +44,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         B.data_ptr<float>(),
         C.data_ptr<float>()
     );
-    return C.to(torch::kFloat16);
+    return C;
 }
