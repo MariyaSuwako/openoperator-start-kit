@@ -10,8 +10,8 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
     uint32_t start_batch = taskId * batch_per_core;
 
     // NRAM 空间：用于缓存一行数据和 reduce 输出
-    __nram__ half nram_input[11][2048];
-    __nram__ half nram_output[11][186];
+    __nram__ half nram_input[22528];
+    __nram__ half nram_output[2046];
     float sum;   // 标量累加器（使用 float 保证精度）
 
     for (uint32_t i = 0; i < batch_per_core; i++) {
