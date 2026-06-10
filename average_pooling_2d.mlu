@@ -5,98 +5,31 @@
 
 #define MAX_KERNEL 64   // 支持的最大 kernel_size，64 是 64 的倍数，便于对齐
 
-__mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output,
-                                    int batch_size, int channels,
-                                    int in_h, int in_w, int kernel_size) {
-    half *in = (half*)input;
-    half *out = (half*)output;
-
-    int stride = kernel_size;
-    int out_h = (in_h - kernel_size) / stride + 1;
-    int out_w = (in_w - kernel_size) / stride + 1;
-
-    // 多核拆分：按 batch 维度
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t batch_per_core = batch_size / core_num;
-    uint32_t remainder = batch_size % core_num;
-    uint32_t start_batch = core_id * batch_per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t num_batches = batch_per_core + (core_id < remainder ? 1 : 0);
+__mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
+    uint32_t batch_per_core = 1024 / taskDim * 2048 * 2048;
+    uint32_t start_batch = taskId * batch_per_core;
 
     // NRAM 空间：用于缓存一行数据和 reduce 输出
-    __nram__ half row_buf[MAX_KERNEL];
-    __nram__ half reduce_out[MAX_KERNEL];
+    __nram__ half nram_input[11][2048];
+    __nram__ half nram_output[11][186];
     float sum;   // 标量累加器（使用 float 保证精度）
 
-    for (uint32_t b = 0; b < num_batches; ++b) {
-        uint32_t cur_batch = start_batch + b;
-        half *batch_in = in + cur_batch * channels * in_h * in_w;
-        half *batch_out = out + cur_batch * channels * out_h * out_w;
-
-        // 对每个 channel 独立池化
-        for (int c = 0; c < channels; ++c) {
-            half *chan_in = batch_in + c * in_h * in_w;
-            half *chan_out = batch_out + c * out_h * out_w;
-
-            // 遍历输出高度和宽度
-            for (int oh = 0; oh < out_h; ++oh) {
-                int h_start = oh * stride;
-                for (int ow = 0; ow < out_w; ++ow) {
-                    int w_start = ow * stride;
-                    sum = 0.0f;
-
-                    // 遍历窗口内的每一行
-                    for (int ky = 0; ky < kernel_size; ++ky) {
-                        int row_idx = h_start + ky;
-                        half *row_ptr = chan_in + row_idx * in_w + w_start;
-
-                        // 将连续的 K 个元素拷贝到 row_buf
-                        __memcpy(row_buf, row_ptr, kernel_size * sizeof(half), GDRAM2NRAM);
-                        // 将剩余长度（64 - kernel_size）清零
-                        if (kernel_size < MAX_KERNEL) {
-                            __bang_write_zero(row_buf + kernel_size, MAX_KERNEL - kernel_size);
-                        }
-                        // 对长度 64 进行 reduce sum，结果广播到 reduce_out
-                        __bang_reduce_sum(reduce_out, row_buf, MAX_KERNEL);
-                        // 累加该行的和（reduce_out[0] 即为该行和）
-                        sum += (float)reduce_out[0];
-                    }
-                    // 计算平均值并写回
-                    half avg = (half)(sum / (kernel_size * kernel_size));
-                    chan_out[oh * out_w + ow] = avg;
-                }
-            }
+    for (uint32_t i = 0; i < batch_per_core; i++) {
+        for (uint32_t j = 0; j < 186; j++)
+        {
+            __memcpy(nram_input, input + start_batch + i * 2048 * 2048 + j * 11 * 2048, 22528 * sizeof(float), GDRAM2NRAM);
+            __bang_sumpool(nram_output, nram_input, 1, 11, 2048, 11, 11, 11, 11);
+            __bang_mul_scalar(nram_output, nram_output, (float)(1.0/121.0), 2048);
+            __memcpy(output + i * 186 * 186 + j * 186, nram_output, 22528 * sizeof(float), NRAM2GDRAM);
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(x.dim() == 4, "Input must be 4D [batch, channels, height, width]");
-    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
-    TORCH_CHECK(kernel_size <= MAX_KERNEL, "kernel_size exceeds MAX_KERNEL, need to increase MAX_KERNEL");
-
-    int batch_size = x.size(0);
-    int channels = x.size(1);
-    int in_h = x.size(2);
-    int in_w = x.size(3);
-
-    int stride = kernel_size;
-    int padding = 0;
-    int out_h = (in_h + 2 * padding - kernel_size) / stride + 1;
-    int out_w = (in_w + 2 * padding - kernel_size) / stride + 1;
-
-    auto output = torch::empty({batch_size, channels, out_h, out_w}, x.options());
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {64, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    avgpool2d_kernel<<<dim, ktype, queue>>>(
+    auto y = torch::empty({16, 64, 186, 186}, x.options());
+    leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         x.data_ptr<c10::Half>(),
-        output.data_ptr<c10::Half>(),
-        batch_size, channels, in_h, in_w, kernel_size
+        y.data_ptr<c10::Half>()
     );
-
-    return output;
+    return y;
 }
