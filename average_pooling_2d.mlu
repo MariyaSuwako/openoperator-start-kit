@@ -21,7 +21,7 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
         for (uint32_t j = 0; j < 11; j++)
         {
             __memcpy(nram_input, input + start_batch_in + i * 11 * 2048 * 64 + j * 2048 * 64, 131072 * sizeof(half), GDRAM2NRAM);
-            __bang_sumpool(nram_temp, nram_input, 64, 1, 2048, 1, 11, 1, 11);
+            __bang_sumpool(nram_temp, nram_input, 64, 1, 2048, 1, 11, 11, 1);
             __bang_mul_scalar(nram_temp, nram_temp, (half)(1.0/121.0), 11904);
             __bang_add(nram_output, nram_output, nram_temp, 11904);
         }
@@ -31,7 +31,7 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
     x = x.permute({0, 2, 3, 1});
-    auto y = torch::empty({16, 64, 186, 186}, x.options());
+    auto y = torch::empty({16, 186, 186, 64}, x.options());
     avgpool2d_kernel<<<(cnrtDim3_t){16, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         x.data_ptr<c10::Half>(),
         y.data_ptr<c10::Half>()
