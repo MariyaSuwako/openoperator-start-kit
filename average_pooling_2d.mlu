@@ -13,7 +13,7 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
 
     __nram__ half nram_input[131072];
     __nram__ half nram_temp[11904];
-    __nram__ half nram_temp[11904];
+    __nram__ half nram_output[11904];
 
     for (uint32_t i = 0; i < 186; i++)
     {
