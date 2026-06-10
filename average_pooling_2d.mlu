@@ -11,14 +11,19 @@ __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
     uint32_t start_batch_in = taskId * batch_per_core_in;
     uint32_t start_batch_out = taskId * batch_per_core_out;
 
-    __nram__ half nram_input[1441792];
-    __nram__ half nram_output[11904];
+    __nram__ half nram_input[131072];
+    __nram__ half nram_temp[11904];
+    __nram__ half nram_temp[11904];
 
     for (uint32_t i = 0; i < 186; i++)
     {
-        __memcpy(nram_input, input + start_batch_in + i * 11 * 2048 * 64, 180224 * sizeof(half), GDRAM2NRAM);
-        __bang_sumpool(nram_output, nram_input, 64, 11, 2048, 11, 11, 11, 11);
-        __bang_mul_scalar(nram_output, nram_output, (half)(1.0/121.0), 2048);
+        for (uint32_t j = 0; j < 11; j++)
+        {
+            __memcpy(nram_input, input + start_batch_in + i * 11 * 2048 * 64 + j * 2048 * 64, 180224 * sizeof(half), GDRAM2NRAM);
+            __bang_sumpool(nram_temp, nram_input, 64, 1, 2048, 1, 11, 1, 11);
+            __bang_mul_scalar(nram_temp, nram_temp, (half)(1.0/121.0), 2048);
+            __bang_add(nram_output, nram_output, nram_temp, 2048);
+        }
         __memcpy(output + start_batch_out + i * 186 * 64, nram_output, 11904 * sizeof(half), NRAM2GDRAM);
     }
 }
