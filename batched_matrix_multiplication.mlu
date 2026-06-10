@@ -43,5 +43,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         B.data_ptr<c10::Half>(),
         C.data_ptr<c10::Half>()
     );
-    return C;
+    return C;//
 }
