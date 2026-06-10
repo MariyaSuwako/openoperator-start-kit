@@ -38,7 +38,7 @@ __mlu_entry__ void leakyrelu_kernel(float *input_A, float *input_B, float *outpu
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     A = A.to(torch::kFloat32);
     B = B.to(torch::kFloat32);
-    auto C = torch::empty({128, 512, 2048}, A.options());
+    auto C = torch::empty({128, 512, 2048}, B.options());
     leakyrelu_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         A.data_ptr<float>(),
         B.data_ptr<float>(),
