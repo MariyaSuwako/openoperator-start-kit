@@ -6,28 +6,29 @@
 #define MAX_KERNEL 64   // 支持的最大 kernel_size，64 是 64 的倍数，便于对齐
 
 __mlu_entry__ void avgpool2d_kernel(c10::Half *input, c10::Half *output) {
-    uint32_t batch_per_core = 1024 / taskDim * 2048 * 2048;
-    uint32_t start_batch = taskId * batch_per_core;
+    uint32_t batch_per_core_in = 16 / taskDim * 64 * 2048 * 2048;
+    uint32_t batch_per_core_out = 16 / taskDim * 64 * 186 * 186;
+    uint32_t start_batch_in = taskId * batch_per_core;
+    uint32_t start_batch_out = taskId * batch_per_core;
 
-    __nram__ half nram_input[22528];
-    __nram__ half nram_output[2046];
+    __nram__ half nram_input[1441792];
+    __nram__ half nram_output[11904];
 
-    for (uint32_t i = 0; i < batch_per_core; i++) {
-        for (uint32_t j = 0; j < 186; j++)
-        {
-            __memcpy(nram_input, input + start_batch + i * 2048 * 2048 + j * 11 * 2048, 22528 * sizeof(half), GDRAM2NRAM);
-            __bang_sumpool(nram_output, nram_input, 1, 11, 2048, 11, 11, 11, 11);
-            __bang_mul_scalar(nram_output, nram_output, (half)(1.0/121.0), 2048);
-            __memcpy(output + i * 186 * 186 + j * 186, nram_output, 22528 * sizeof(half), NRAM2GDRAM);
-        }
+    for (uint32_t i = 0; i < 186; i++)
+    {
+        __memcpy(nram_input, input + start_batch_in + i * 11 * 2048 * 64, 180224 * sizeof(half), GDRAM2NRAM);
+        __bang_sumpool(nram_output, nram_input, 64, 11, 2048, 11, 11, 11, 11);
+        __bang_mul_scalar(nram_output, nram_output, (half)(1.0/121.0), 2048);
+        __memcpy(output + start_batch_out + i * 186 * 64, nram_output, 11904 * sizeof(half), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+    x = x.permute(0, 2, 3, 1);
     auto y = torch::empty({16, 64, 186, 186}, x.options());
-    avgpool2d_kernel<<<(cnrtDim3_t){64, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
+    avgpool2d_kernel<<<(cnrtDim3_t){16, 1, 1}, cnrtFuncTypeUnion1, torch_mlu::getCurMLUStream()>>>(
         x.data_ptr<c10::Half>(),
         y.data_ptr<c10::Half>()
     );
-    return y;
+    return y.permute(0, 3, 1, 2);
 }
