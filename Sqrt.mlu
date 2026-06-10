@@ -3,7 +3,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 128  // 必须为32的倍数，以便向量化指令高效运行
+#define CHUNK_SIZE 128  // NRAM 缓冲区大小
 
 // MLU 核函数：逐元素计算 sqrt(abs(x))
 __mlu_entry__ void abs_sqrt_kernel(const float* x, float* output, int n) {
@@ -13,24 +13,17 @@ __mlu_entry__ void abs_sqrt_kernel(const float* x, float* output, int n) {
     int start = task_id * chunk;
     int end = (task_id == task_num - 1) ? n : start + chunk;
 
-    __nram__ float buf[CHUNK_SIZE];  // NRAM 缓冲区
+    __nram__ float buf[CHUNK_SIZE];
 
     for (int i = start; i < end; i += CHUNK_SIZE) {
         int size = (end - i) < CHUNK_SIZE ? (end - i) : CHUNK_SIZE;
-        // 从全局内存加载数据到 NRAM
+        // 从全局内存加载到 NRAM
         __memcpy(buf, x + i, size * sizeof(float), GDRAM2NRAM);
-
-        if (size % 32 == 0) {
-            // 向量化加速：先取绝对值，再开平方
-            __bang_abs(buf, buf, size);
-            __bang_sqrt(buf, buf, size);
-        } else {
-            // 剩余不足32倍数的部分采用标量循环（保证正确性）
-            for (int j = 0; j < size; ++j) {
-                float val = buf[j];
-                val = (val >= 0) ? val : -val;  // 绝对值
-                buf[j] = sqrtf(val);            // 平方根
-            }
+        // 标量循环：绝对值 + 平方根
+        for (int j = 0; j < size; ++j) {
+            float val = buf[j];
+            val = (val >= 0) ? val : -val;
+            buf[j] = sqrtf(val);
         }
         // 写回输出张量
         __memcpy(output + i, buf, size * sizeof(float), NRAM2GDRAM);
@@ -39,24 +32,20 @@ __mlu_entry__ void abs_sqrt_kernel(const float* x, float* output, int n) {
 
 // PyTorch 包装函数
 torch::Tensor bang_func(torch::Tensor x) {
-    // 确保输入为连续内存且类型为 float32
+    // 确保输入为连续内存且数据类型为 float32
     auto x_contig = x.contiguous().to(torch::kFloat32);
-    TORCH_CHECK(x_contig.device().is_mlu(), "Input tensor must be on MLU device");
-
     int total_elements = x_contig.numel();
     auto output = torch::empty_like(x_contig);
 
-    // 配置 64 个计算核（可根据实际数据量调整）
+    // 配置计算核数（64 核，可根据数据量调整）
     cnrtDim3_t grid_dim = {64, 1, 1};
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动核函数
     abs_sqrt_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         x_contig.data_ptr<float>(),
         output.data_ptr<float>(),
         total_elements
     );
-
-    cnrtQueueSync(queue);  // 同步等待计算完成
+    cnrtQueueSync(queue);
     return output;
 }
