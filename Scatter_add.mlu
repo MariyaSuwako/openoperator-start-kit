@@ -2,70 +2,84 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+// 每个输出行最多支持的列宽（D 上限）；默认 D=256
+#define MAX_D 1024
+// 一次性加载到 NRAM 的最大 index 数（N 上限）；默认 N=4096
+#define MAX_N 8192
 
+// ---------- Scatter-add kernel (按输出行分工, 无 race) ----------
 __mlu_entry__ void scatter_add_kernel(
-    const float *src,
-    const int *index,
+    float *src,
+    int   *index,
     float *output,
     int N,
     int D,
     int dim_size) {
-    int tid = taskId;
-    int num_cores = taskDim;
 
-    int chunk = (N + num_cores - 1) / num_cores;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > N) {
-        end = N;
-    }
+    // 每核独占 dim_size 中的一段输出行 -> 零 race
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = dim_size / core_num;
+    uint32_t rem      = dim_size % core_num;
+    uint32_t row_start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t row_count = per_core + (core_id < rem ? 1 : 0);
+    if (row_count == 0) return;
 
-    __nram__ int dst_row_nram;
-    __nram__ float src_val;
-    __nram__ float dst_val;
+    __nram__ int   idx_buf[MAX_N];     // 一次性载入全部 index
+    __nram__ float acc_buf[MAX_D];     // 当前输出行累加器
+    __nram__ float src_buf[MAX_D];     // 当前 src 行
 
-    for (int i = start; i < end; ++i) {
-        __memcpy(&dst_row_nram, index + i, sizeof(int), GDRAM2NRAM);
-        int dst_row = dst_row_nram;
-        if (dst_row < 0 || dst_row >= dim_size) {
-            continue;
+    // 1. 把所有 index 加载到 NRAM
+    __memcpy(idx_buf, index, N * sizeof(int), GDRAM2NRAM);
+
+    // 2. 遍历本核负责的每个输出行
+    for (uint32_t r = row_start; r < row_start + row_count; ++r) {
+        int target = (int)r;
+
+        // 清零累加器
+        __bang_write_zero(acc_buf, D);
+
+        // 扫 N 个 index，命中则累加对应 src 行
+        for (int i = 0; i < N; ++i) {
+            if (idx_buf[i] != target) continue;
+            __memcpy(src_buf, src + i * D, D * sizeof(float), GDRAM2NRAM);
+            __bang_add(acc_buf, acc_buf, src_buf, D);
         }
-        int src_base = i * D;
-        int dst_base = dst_row * D;
-        for (int j = 0; j < D; ++j) {
-            __memcpy(&src_val, src + src_base + j, sizeof(float), GDRAM2NRAM);
-            __memcpy(&dst_val, output + dst_base + j, sizeof(float), GDRAM2NRAM);
-            dst_val += src_val;
-            __memcpy(output + dst_base + j, &dst_val, sizeof(float), NRAM2GDRAM);
-        }
+
+        // 写回该输出行
+        __memcpy(output + (uint32_t)target * D, acc_buf, D * sizeof(float), NRAM2GDRAM);
     }
 }
 
+// ---------- 包装函数 ----------
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
-    TORCH_CHECK(src.dim() == 2, "src must be 2D [N, D]");
+    TORCH_CHECK(src.dim() == 2,   "src must be 2D [N, D]");
     TORCH_CHECK(index.dim() == 1, "index must be 1D [N]");
-    TORCH_CHECK(src.size(0) == index.size(0), "src.size(0) must match index.size(0)");
-    TORCH_CHECK(dim_size >= 0, "dim_size must be non-negative");
+    TORCH_CHECK(src.size(0) == index.size(0),
+                "src.size(0) must match index.size(0)");
+    TORCH_CHECK(dim_size > 0, "dim_size must be positive");
 
-    auto src_contig = src.contiguous().to(torch::kFloat32);
+    auto src_contig   = src.contiguous().to(torch::kFloat32);
     auto index_contig = index.contiguous().to(torch::kInt32);
 
-    int N = src_contig.size(0);
-    int D = src_contig.size(1);
+    int N = (int)src_contig.size(0);
+    int D = (int)src_contig.size(1);
+
+    TORCH_CHECK(D <= MAX_D, "D exceeds NRAM buffer (MAX_D)");
+    TORCH_CHECK(N <= MAX_N, "N exceeds NRAM buffer (MAX_N)");
+
     auto output = torch::zeros({dim_size, D}, src_contig.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid_dim = {1, 1, 1};
+    // Union1 要求 taskDim 是 cluster 大小 (4) 的整数倍；用 16 与仓库其它 kernel 一致
+    cnrtDim3_t grid_dim = {16, 1, 1};
 
     scatter_add_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         src_contig.data_ptr<float>(),
         index_contig.data_ptr<int>(),
         output.data_ptr<float>(),
-        N,
-        D,
-        dim_size
+        N, D, dim_size
     );
-    cnrtQueueSync(queue);
 
     return output;
 }
