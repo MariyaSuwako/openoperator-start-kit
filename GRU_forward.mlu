@@ -4,6 +4,7 @@
 #include <c10/util/Half.h>
 #include <math.h>
 
+
 #define DOT_CHUNK 256
 
 __mlu_entry__ void gru_step_kernel(

@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+
 __mlu_entry__ void scatter_add_kernel(
     const float *src,
     const int *index,
