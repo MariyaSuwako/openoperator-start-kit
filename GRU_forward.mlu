@@ -1,176 +1,164 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <c10/util/Half.h>
 #include <math.h>
 
+// 上限：默认 input=256, hidden=512
+#define MAX_INPUT  1024
+#define MAX_HIDDEN 1024
+#define MAX_3HIDDEN 3072
 
-#define DOT_CHUNK 256
-
+// ---------- GRU 单步 kernel (fp32) ----------
+// 并行策略：每个核处理若干 (batch, hidden_unit) 对
+// 数据复用：同一 batch 的 x / h_prev 跨 hidden_unit 重复使用
 __mlu_entry__ void gru_step_kernel(
-    c10::Half *seq_input,
-    c10::Half *h_prev,
-    c10::Half *weight_ih,
-    int weight_ih_width,
-    c10::Half *weight_hh,
-    c10::Half *bias_ih,
-    c10::Half *bias_hh,
-    c10::Half *h_next,
-    c10::Half *seq_output,
+    float *seq_input,
+    float *h_prev,
+    float *weight_ih,
+    int   weight_ih_width,
+    float *weight_hh,
+    float *bias_ih,
+    float *bias_hh,
+    float *h_next,
+    float *seq_output,
     int batch,
     int seq_len,
     int step,
     int input_width,
     int hidden_size) {
-    uint32_t core_id = taskId;
+
+    uint32_t total    = (uint32_t)batch * (uint32_t)hidden_size;
+    uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core = batch / core_num;
-    uint32_t remainder = batch % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    uint32_t per_core = total / core_num;
+    uint32_t rem      = total % core_num;
+    uint32_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t count = per_core + (core_id < rem ? 1 : 0);
+    if (count == 0) return;
 
-    __nram__ half x_buf[DOT_CHUNK];
-    __nram__ half h_buf[DOT_CHUNK];
-    __nram__ half w_buf[DOT_CHUNK];
-    __nram__ half mul_buf[DOT_CHUNK];
-    __nram__ half sum_buf[DOT_CHUNK];
-    __nram__ half prev_half;
-    __nram__ half out_half;
-    __nram__ half bias_half;
+    __nram__ float x_buf[MAX_INPUT];
+    __nram__ float h_buf[MAX_HIDDEN];
+    __nram__ float w_buf[MAX_HIDDEN];
+    __nram__ float mul_buf[MAX_HIDDEN];
+    __nram__ float sum_buf[64];
+    __nram__ float b_ih_buf[MAX_3HIDDEN];
+    __nram__ float b_hh_buf[MAX_3HIDDEN];
 
-    for (uint32_t b = start; b < start + count; ++b) {
-        c10::Half *x_ptr = seq_input + (b * seq_len + step) * input_width;
-        c10::Half *h_prev_ptr = h_prev + b * hidden_size;
-        c10::Half *h_next_ptr = h_next + b * hidden_size;
-        c10::Half *seq_out_ptr = seq_output + (b * seq_len + step) * hidden_size;
+    // 一次性载入所有 bias
+    __memcpy(b_ih_buf, bias_ih, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
+    __memcpy(b_hh_buf, bias_hh, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
 
-        for (int h = 0; h < hidden_size; ++h) {
-            float r_x = 0.0f;
-            float z_x = 0.0f;
-            float n_x = 0.0f;
-            float r_h = 0.0f;
-            float z_h = 0.0f;
-            float n_h = 0.0f;
+    // 对齐尺寸（reduce_sum 通常要求 64 对齐）
+    int iw_aligned = (input_width  + 63) & ~63;
+    int hw_aligned = (hidden_size  + 63) & ~63;
 
-            for (int off = 0; off < input_width; off += DOT_CHUNK) {
-                int len = (off + DOT_CHUNK <= input_width) ? DOT_CHUNK : (input_width - off);
-                int aligned_len = (len + 63) & ~63;
+    int prev_b = -1;
 
-                __memcpy(x_buf, x_ptr + off, len * sizeof(half), GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(x_buf + len, aligned_len - len);
-                }
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        int b = (int)(idx / (uint32_t)hidden_size);
+        int h = (int)(idx % (uint32_t)hidden_size);
 
-                __memcpy(w_buf,
-                         weight_ih + h * weight_ih_width + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, x_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                r_x += (float)sum_buf[0];
-
-                __memcpy(w_buf,
-                         weight_ih + (hidden_size + h) * weight_ih_width + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, x_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                z_x += (float)sum_buf[0];
-
-                __memcpy(w_buf,
-                         weight_ih + (2 * hidden_size + h) * weight_ih_width + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, x_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                n_x += (float)sum_buf[0];
+        // 仅当 batch 切换时重新加载 x 和 h_prev
+        if (b != prev_b) {
+            __memcpy(x_buf,
+                     seq_input + (b * seq_len + step) * input_width,
+                     input_width * sizeof(float),
+                     GDRAM2NRAM);
+            if (iw_aligned > input_width) {
+                __bang_write_zero(x_buf + input_width, iw_aligned - input_width);
             }
-
-            for (int off = 0; off < hidden_size; off += DOT_CHUNK) {
-                int len = (off + DOT_CHUNK <= hidden_size) ? DOT_CHUNK : (hidden_size - off);
-                int aligned_len = (len + 63) & ~63;
-
-                __memcpy(h_buf, h_prev_ptr + off, len * sizeof(half), GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(h_buf + len, aligned_len - len);
-                }
-
-                __memcpy(w_buf,
-                         weight_hh + h * hidden_size + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, h_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                r_h += (float)sum_buf[0];
-
-                __memcpy(w_buf,
-                         weight_hh + (hidden_size + h) * hidden_size + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, h_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                z_h += (float)sum_buf[0];
-
-                __memcpy(w_buf,
-                         weight_hh + (2 * hidden_size + h) * hidden_size + off,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-                if (aligned_len > len) {
-                    __bang_write_zero(w_buf + len, aligned_len - len);
-                }
-                __bang_mul(mul_buf, h_buf, w_buf, aligned_len);
-                __bang_reduce_sum(sum_buf, mul_buf, aligned_len);
-                n_h += (float)sum_buf[0];
+            __memcpy(h_buf,
+                     h_prev + b * hidden_size,
+                     hidden_size * sizeof(float),
+                     GDRAM2NRAM);
+            if (hw_aligned > hidden_size) {
+                __bang_write_zero(h_buf + hidden_size, hw_aligned - hidden_size);
             }
-
-            __memcpy(&bias_half, bias_ih + h, sizeof(half), GDRAM2NRAM);
-            float r = r_x + (float)bias_half;
-            __memcpy(&bias_half, bias_hh + h, sizeof(half), GDRAM2NRAM);
-            r += r_h + (float)bias_half;
-            r = 1.0f / (1.0f + expf(-r));
-
-            __memcpy(&bias_half, bias_ih + hidden_size + h, sizeof(half), GDRAM2NRAM);
-            float z = z_x + (float)bias_half;
-            __memcpy(&bias_half, bias_hh + hidden_size + h, sizeof(half), GDRAM2NRAM);
-            z += z_h + (float)bias_half;
-            z = 1.0f / (1.0f + expf(-z));
-
-            __memcpy(&bias_half, bias_ih + 2 * hidden_size + h, sizeof(half), GDRAM2NRAM);
-            float n_val = n_x + (float)bias_half;
-            __memcpy(&bias_half, bias_hh + 2 * hidden_size + h, sizeof(half), GDRAM2NRAM);
-            n_val = tanhf(n_val + r * (n_h + (float)bias_half));
-
-            __memcpy(&prev_half, h_prev_ptr + h, sizeof(half), GDRAM2NRAM);
-            float prev = (float)prev_half;
-            out_half = (half)((1.0f - z) * n_val + z * prev);
-
-            __memcpy(h_next_ptr + h, &out_half, sizeof(half), NRAM2GDRAM);
-            __memcpy(seq_out_ptr + h, &out_half, sizeof(half), NRAM2GDRAM);
+            prev_b = b;
         }
+
+        // === 3 个 W_ih 点积 (input_width 维) ===
+        // r_x
+        __memcpy(w_buf, weight_ih + h * weight_ih_width,
+                 input_width * sizeof(float), GDRAM2NRAM);
+        if (iw_aligned > input_width) {
+            __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
+        }
+        __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
+        float r_x = sum_buf[0];
+
+        // z_x
+        __memcpy(w_buf, weight_ih + (hidden_size + h) * weight_ih_width,
+                 input_width * sizeof(float), GDRAM2NRAM);
+        if (iw_aligned > input_width) {
+            __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
+        }
+        __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
+        float z_x = sum_buf[0];
+
+        // n_x
+        __memcpy(w_buf, weight_ih + (2 * hidden_size + h) * weight_ih_width,
+                 input_width * sizeof(float), GDRAM2NRAM);
+        if (iw_aligned > input_width) {
+            __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
+        }
+        __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
+        float n_x = sum_buf[0];
+
+        // === 3 个 W_hh 点积 (hidden_size 维) ===
+        // r_h
+        __memcpy(w_buf, weight_hh + h * hidden_size,
+                 hidden_size * sizeof(float), GDRAM2NRAM);
+        if (hw_aligned > hidden_size) {
+            __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
+        }
+        __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
+        float r_h = sum_buf[0];
+
+        // z_h
+        __memcpy(w_buf, weight_hh + (hidden_size + h) * hidden_size,
+                 hidden_size * sizeof(float), GDRAM2NRAM);
+        if (hw_aligned > hidden_size) {
+            __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
+        }
+        __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
+        float z_h = sum_buf[0];
+
+        // n_h
+        __memcpy(w_buf, weight_hh + (2 * hidden_size + h) * hidden_size,
+                 hidden_size * sizeof(float), GDRAM2NRAM);
+        if (hw_aligned > hidden_size) {
+            __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
+        }
+        __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
+        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
+        float n_h = sum_buf[0];
+
+        // === GRU 门方程 ===
+        float r = 1.0f / (1.0f + expf(-(r_x + b_ih_buf[h] + r_h + b_hh_buf[h])));
+        float z = 1.0f / (1.0f + expf(-(z_x + b_ih_buf[hidden_size + h] +
+                                        z_h + b_hh_buf[hidden_size + h])));
+        float n_val = tanhf(n_x + b_ih_buf[2 * hidden_size + h] +
+                            r * (n_h + b_hh_buf[2 * hidden_size + h]));
+        float prev_val = h_buf[h];
+        float out_val = (1.0f - z) * n_val + z * prev_val;
+
+        // 写回 h_next 和 seq_output
+        __nram__ float tmp;
+        tmp = out_val;
+        __memcpy(h_next + b * hidden_size + h, &tmp, sizeof(float), NRAM2GDRAM);
+        __memcpy(seq_output + (b * seq_len + step) * hidden_size + h,
+                 &tmp, sizeof(float), NRAM2GDRAM);
     }
 }
 
 // ============================================================
-// 包装函数：签名必须匹配评估脚本（init 参数全部展开）
-//   forward x        : 1 个 Tensor
-//   init 权重(8 个)  : weight_ih_l0/weight_hh_l0/bias_ih_l0/bias_hh_l0/
-//                      weight_ih_l1/weight_hh_l1/bias_ih_l1/bias_hh_l1
-//   init 标量(3 个)  : input_size, hidden_size, num_layers
+// 包装函数 (签名严格匹配评估器: 9 Tensor + 3 int)
 // ============================================================
 torch::Tensor bang_func(torch::Tensor x,
                         torch::Tensor weight_ih_l0,
@@ -184,37 +172,36 @@ torch::Tensor bang_func(torch::Tensor x,
                         int input_size,
                         int hidden_size,
                         int num_layers) {
-    TORCH_CHECK(num_layers == 2, "this kernel only supports num_layers == 2 (per problem spec)");
-    TORCH_CHECK(hidden_size > 0 && input_size > 0, "input/hidden size must be positive");
+    TORCH_CHECK(num_layers == 2, "this kernel only supports num_layers == 2");
+    TORCH_CHECK(hidden_size > 0 && input_size > 0, "size must be positive");
+    TORCH_CHECK(hidden_size <= MAX_HIDDEN, "hidden_size too large");
+    TORCH_CHECK(input_size <= MAX_INPUT,  "input_size too large");
+    TORCH_CHECK(3 * hidden_size <= MAX_3HIDDEN, "3*hidden_size too large");
 
-    auto x_contig    = x.contiguous().to(torch::kFloat16);
-    auto w_ih_l0_c   = weight_ih_l0.contiguous().to(torch::kFloat16);
-    auto w_hh_l0_c   = weight_hh_l0.contiguous().to(torch::kFloat16);
-    auto b_ih_l0_c   = bias_ih_l0.contiguous().to(torch::kFloat16);
-    auto b_hh_l0_c   = bias_hh_l0.contiguous().to(torch::kFloat16);
-    auto w_ih_l1_c   = weight_ih_l1.contiguous().to(torch::kFloat16);
-    auto w_hh_l1_c   = weight_hh_l1.contiguous().to(torch::kFloat16);
-    auto b_ih_l1_c   = bias_ih_l1.contiguous().to(torch::kFloat16);
-    auto b_hh_l1_c   = bias_hh_l1.contiguous().to(torch::kFloat16);
+    // 全程 fp32 (精度关键)
+    auto x_contig    = x.contiguous().to(torch::kFloat32);
+    auto w_ih_l0_c   = weight_ih_l0.contiguous().to(torch::kFloat32);
+    auto w_hh_l0_c   = weight_hh_l0.contiguous().to(torch::kFloat32);
+    auto b_ih_l0_c   = bias_ih_l0.contiguous().to(torch::kFloat32);
+    auto b_hh_l0_c   = bias_hh_l0.contiguous().to(torch::kFloat32);
+    auto w_ih_l1_c   = weight_ih_l1.contiguous().to(torch::kFloat32);
+    auto w_hh_l1_c   = weight_hh_l1.contiguous().to(torch::kFloat32);
+    auto b_ih_l1_c   = bias_ih_l1.contiguous().to(torch::kFloat32);
+    auto b_hh_l1_c   = bias_hh_l1.contiguous().to(torch::kFloat32);
 
     TORCH_CHECK(x_contig.dim() == 3, "x must be 3-D [batch, seq_len, input_size]");
     const int batch   = x_contig.size(0);
     const int seq_len = x_contig.size(1);
     TORCH_CHECK(x_contig.size(2) == input_size, "x last dim must equal input_size");
 
-    // 形状校验
     TORCH_CHECK(w_ih_l0_c.dim() == 2 && w_ih_l0_c.size(0) == 3 * hidden_size
-                && w_ih_l0_c.size(1) == input_size, "weight_ih_l0 shape mismatch");
+                && w_ih_l0_c.size(1) == input_size,  "weight_ih_l0 shape mismatch");
     TORCH_CHECK(w_hh_l0_c.dim() == 2 && w_hh_l0_c.size(0) == 3 * hidden_size
                 && w_hh_l0_c.size(1) == hidden_size, "weight_hh_l0 shape mismatch");
     TORCH_CHECK(w_ih_l1_c.dim() == 2 && w_ih_l1_c.size(0) == 3 * hidden_size
                 && w_ih_l1_c.size(1) == hidden_size, "weight_ih_l1 shape mismatch");
     TORCH_CHECK(w_hh_l1_c.dim() == 2 && w_hh_l1_c.size(0) == 3 * hidden_size
                 && w_hh_l1_c.size(1) == hidden_size, "weight_hh_l1 shape mismatch");
-    TORCH_CHECK(b_ih_l0_c.numel() == 3 * hidden_size, "bias_ih_l0 size mismatch");
-    TORCH_CHECK(b_hh_l0_c.numel() == 3 * hidden_size, "bias_hh_l0 size mismatch");
-    TORCH_CHECK(b_ih_l1_c.numel() == 3 * hidden_size, "bias_ih_l1 size mismatch");
-    TORCH_CHECK(b_hh_l1_c.numel() == 3 * hidden_size, "bias_hh_l1 size mismatch");
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_dim = {16, 1, 1};
@@ -225,31 +212,31 @@ torch::Tensor bang_func(torch::Tensor x,
     for (int layer = 0; layer < num_layers; ++layer) {
         int cur_input_size = (layer == 0) ? input_size : hidden_size;
 
-        c10::Half *layer_w_ih = (layer == 0) ? w_ih_l0_c.data_ptr<c10::Half>()
-                                              : w_ih_l1_c.data_ptr<c10::Half>();
-        c10::Half *layer_w_hh = (layer == 0) ? w_hh_l0_c.data_ptr<c10::Half>()
-                                              : w_hh_l1_c.data_ptr<c10::Half>();
-        c10::Half *layer_b_ih = (layer == 0) ? b_ih_l0_c.data_ptr<c10::Half>()
-                                              : b_ih_l1_c.data_ptr<c10::Half>();
-        c10::Half *layer_b_hh = (layer == 0) ? b_hh_l0_c.data_ptr<c10::Half>()
-                                              : b_hh_l1_c.data_ptr<c10::Half>();
+        float *layer_w_ih = (layer == 0) ? w_ih_l0_c.data_ptr<float>()
+                                          : w_ih_l1_c.data_ptr<float>();
+        float *layer_w_hh = (layer == 0) ? w_hh_l0_c.data_ptr<float>()
+                                          : w_hh_l1_c.data_ptr<float>();
+        float *layer_b_ih = (layer == 0) ? b_ih_l0_c.data_ptr<float>()
+                                          : b_ih_l1_c.data_ptr<float>();
+        float *layer_b_hh = (layer == 0) ? b_hh_l0_c.data_ptr<float>()
+                                          : b_hh_l1_c.data_ptr<float>();
         int weight_ih_width = cur_input_size;
 
-        cur_output = torch::empty({batch, seq_len, hidden_size}, x_contig.options());
-        auto h_prev = torch::zeros({batch, hidden_size}, x_contig.options());
-        auto h_next = torch::empty({batch, hidden_size}, x_contig.options());
+        cur_output  = torch::empty({batch, seq_len, hidden_size}, x_contig.options());
+        auto h_prev = torch::zeros({batch, hidden_size},          x_contig.options());
+        auto h_next = torch::empty({batch, hidden_size},          x_contig.options());
 
         for (int step = 0; step < seq_len; ++step) {
             gru_step_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
-                cur_input.data_ptr<c10::Half>(),
-                h_prev.data_ptr<c10::Half>(),
+                cur_input.data_ptr<float>(),
+                h_prev.data_ptr<float>(),
                 layer_w_ih,
                 weight_ih_width,
                 layer_w_hh,
                 layer_b_ih,
                 layer_b_hh,
-                h_next.data_ptr<c10::Half>(),
-                cur_output.data_ptr<c10::Half>(),
+                h_next.data_ptr<float>(),
+                cur_output.data_ptr<float>(),
                 batch,
                 seq_len,
                 step,
