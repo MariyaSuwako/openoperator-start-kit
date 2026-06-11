@@ -1,0 +1,77 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <vector>
+
+__mlu_entry__ void kl_div_partial_sum_kernel(
+    const float *input_log_prob,
+    const float *target_prob,
+    float *partial_sums,
+    int total,
+    int num_cores) {
+    int tid = taskId;
+    if (tid >= num_cores) {
+        return;
+    }
+
+    int chunk = (total + num_cores - 1) / num_cores;
+    int start = tid * chunk;
+    int end = start + chunk;
+    if (end > total) {
+        end = total;
+    }
+
+    float local_sum = 0.0f;
+    for (int i = start; i < end; ++i) {
+        float t = target_prob[i];
+        if (t > 0.0f) {
+            local_sum += t * (logf(t) - input_log_prob[i]);
+        }
+    }
+    partial_sums[tid] = local_sum;
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+    TORCH_CHECK(input_log_prob.dim() == 2 && target_prob.dim() == 2,
+                "Both inputs must be 2D tensors [batch, N]");
+    TORCH_CHECK(input_log_prob.size(0) == target_prob.size(0) &&
+                input_log_prob.size(1) == target_prob.size(1),
+                "Input shapes must match");
+
+    auto input_contig = input_log_prob.contiguous().to(torch::kFloat32);
+    auto target_contig = target_prob.contiguous().to(torch::kFloat32);
+
+    int batch = input_contig.size(0);
+    int n = input_contig.size(1);
+    int total = batch * n;
+    const int num_cores = 64;
+
+    auto partial_sums = torch::zeros({num_cores}, input_contig.options());
+
+    cnrtDim3_t grid_dim = {static_cast<unsigned int>(num_cores), 1, 1};
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    kl_div_partial_sum_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        input_contig.data_ptr<float>(),
+        target_contig.data_ptr<float>(),
+        partial_sums.data_ptr<float>(),
+        total,
+        num_cores
+    );
+    cnrtQueueSync(queue);
+
+    std::vector<float> sums_host(num_cores);
+    cnrtMemcpy(sums_host.data(),
+               partial_sums.data_ptr<float>(),
+               num_cores * sizeof(float),
+               cnrtMemcpyDevToHost);
+
+    float total_sum = 0.0f;
+    for (float value : sums_host) {
+        total_sum += value;
+    }
+
+    float result = total_sum / static_cast<float>(batch);
+    return torch::tensor(result, torch::kFloat32);
+}
