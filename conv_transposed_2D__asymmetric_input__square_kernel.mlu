@@ -1,28 +1,25 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <c10/util/Half.h>
 
-// 单平面最大元素数：覆盖 H_in*W_in 与 H_out*W_out
-// 默认场景：H_in*W_in = 128*256 = 32768，H_out*W_out = 130*258 = 33540
+// 输入平面 32768 (=128*256), 输出平面 33540 (=130*258)
 #define MAX_PLANE 40960
 #define MAX_K2 64
 
-// ---------- 转置 2D 卷积核函数 (float16) ----------
+// ---------- 转置 2D 卷积核函数 (float32, 向量化散播) ----------
 __mlu_entry__ void conv_transpose2d_kernel(
-    c10::Half *x, c10::Half *weight, c10::Half *bias, c10::Half *output,
+    float *x, float *weight, float *bias, float *output,
     int N, int C_in, int C_out, int H_in, int W_in,
     int K, int stride, int padding, int output_padding, int groups,
     int H_out, int W_out) {
 
-    // 每个核处理若干 (n, oc) 对，每对在 NRAM 中累加完整输出平面
     uint32_t total_pairs = (uint32_t)N * (uint32_t)C_out;
-    uint32_t core_id     = taskId;
-    uint32_t core_num    = taskDim;
-    uint32_t per_core    = total_pairs / core_num;
-    uint32_t remainder   = total_pairs % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_pairs / core_num;
+    uint32_t rem      = total_pairs % core_num;
+    uint32_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t count = per_core + (core_id < rem ? 1 : 0);
 
     int C_in_per_group  = C_in / groups;
     int C_out_per_group = C_out / groups;
@@ -30,16 +27,13 @@ __mlu_entry__ void conv_transpose2d_kernel(
     int x_plane   = H_in  * W_in;
     int out_plane = H_out * W_out;
 
-    // NRAM 缓冲区：
-    // x_buf   : 输入平面（half），后续也复用作输出 half 转换缓冲
-    // out_buf : 输出平面累加器（用 float 累加以保证精度）
-    // w_buf   : 当前 (ic, oc_local) 的 K*K 权重
-    __nram__ half  x_buf[MAX_PLANE];
-    __nram__ float out_buf[MAX_PLANE];
-    __nram__ half  w_buf[MAX_K2];
-    __nram__ half  b_val;
+    (void)output_padding;
 
-    (void)output_padding;  // 已经在 host 端计算 H_out/W_out 时使用
+    __nram__ float x_buf[MAX_PLANE];     // 输入平面
+    __nram__ float out_buf[MAX_PLANE];   // 输出平面累加器
+    __nram__ float tmp_buf[MAX_PLANE];   // 临时乘积
+    __nram__ float w_buf[MAX_K2];
+    __nram__ float b_val;
 
     for (uint32_t pair_idx = start; pair_idx < start + count; ++pair_idx) {
         int n  = (int)(pair_idx / (uint32_t)C_out);
@@ -50,54 +44,63 @@ __mlu_entry__ void conv_transpose2d_kernel(
         int ic_start = group_id * C_in_per_group;
         int ic_end   = ic_start + C_in_per_group;
 
-        // 1. 清零累加器
-        for (int i = 0; i < out_plane; ++i) {
-            out_buf[i] = 0.0f;
-        }
+        // 1. 清零输出累加器
+        __bang_write_zero(out_buf, out_plane);
 
-        // 2. 遍历当前 group 内所有输入通道，把每个 ic 的贡献"散播"到 out_buf
+        // 2. 遍历该组 ic
         for (int ic = ic_start; ic < ic_end; ++ic) {
-            // 把输入平面 x[n, ic, :, :] 加载到 NRAM
+            // 加载输入平面
             int x_off_base = (n * C_in + ic) * x_plane;
-            __memcpy(x_buf, x + x_off_base, x_plane * sizeof(half), GDRAM2NRAM);
+            __memcpy(x_buf, x + x_off_base, x_plane * sizeof(float), GDRAM2NRAM);
 
-            // 加载对应权重 weight[ic, oc_local, :, :]
+            // 加载 K*K 权重
             int w_off_base = (ic * C_out_per_group + oc_local) * K2;
-            __memcpy(w_buf, weight + w_off_base, K2 * sizeof(half), GDRAM2NRAM);
+            __memcpy(w_buf, weight + w_off_base, K2 * sizeof(float), GDRAM2NRAM);
 
-            // 散播：对每个 (kh, kw)，把整张 x_buf 经标量缩放后加到 out_buf 的对应位置
+            // 散播
             for (int kh = 0; kh < K; ++kh) {
                 for (int kw = 0; kw < K; ++kw) {
-                    float wv = (float)w_buf[kh * K + kw];
+                    float wv = w_buf[kh * K + kw];
 
+                    // 按行向量化：每行 W_in 元素
                     for (int iy = 0; iy < H_in; ++iy) {
                         int oy = iy * stride + kh - padding;
                         if (oy < 0 || oy >= H_out) continue;
-                        int x_row_off   = iy * W_in;
-                        int out_row_off = oy * W_out;
 
-                        // 内层 ix：ox = ix*stride + kw - padding
-                        // 预先算出有效 ix 区间，避免每次都判分支（stride 任意均成立）
-                        // ox >= 0  -> ix*stride >= padding - kw
-                        // ox < W_out -> ix*stride < W_out + padding - kw
+                        // ox = ix*stride + kw - padding, ix in [0, W_in)
+                        // stride=1 时 ox 连续；通用情况下找有效 ix 子区间
                         int ix_lo, ix_hi;
-                        if (stride > 0) {
-                            int lo_num = padding - kw;
+                        // ox >= 0  -> ix >= ceil((padding-kw)/stride)
+                        int lo_num = padding - kw;
+                        if (stride <= 0) { ix_lo = 0; ix_hi = 0; }
+                        else {
                             ix_lo = (lo_num > 0) ? ((lo_num + stride - 1) / stride) : 0;
-                            int hi_num = W_out + padding - kw;  // ix*stride < hi_num
-                            ix_hi = (hi_num > 0) ? ((hi_num + stride - 1) / stride) : 0;
+                            // ox < W_out -> ix < ceil((W_out+padding-kw)/stride) 但严格 <
+                            // 等价 ix <= (W_out-1+padding-kw)/stride  (向下取整)
+                            int hi_num = W_out - 1 + padding - kw;
+                            ix_hi = (hi_num >= 0) ? (hi_num / stride + 1) : 0;
                             if (ix_hi > W_in) ix_hi = W_in;
                             if (ix_lo < 0) ix_lo = 0;
-                        } else {
-                            ix_lo = 0;
-                            ix_hi = 0;
                         }
+                        int n_valid = ix_hi - ix_lo;
+                        if (n_valid <= 0) continue;
 
-                        for (int ix = ix_lo; ix < ix_hi; ++ix) {
-                            int ox = ix * stride + kw - padding;
-                            // 范围已收敛，不再需要 if 判断
-                            float xv = (float)x_buf[x_row_off + ix];
-                            out_buf[out_row_off + ox] += xv * wv;
+                        if (stride == 1) {
+                            // ox = ix + kw - padding, 连续段
+                            int ox_lo = ix_lo + kw - padding;
+                            int src_off = iy * W_in + ix_lo;
+                            int dst_off = oy * W_out + ox_lo;
+                            // FMA: out += x * wv
+                            __bang_mul_const(tmp_buf, x_buf + src_off, wv, n_valid);
+                            __bang_add(out_buf + dst_off,
+                                       out_buf + dst_off,
+                                       tmp_buf, n_valid);
+                        } else {
+                            // stride>1: ox 非连续，标量回退
+                            for (int ix = ix_lo; ix < ix_hi; ++ix) {
+                                int ox = ix * stride + kw - padding;
+                                out_buf[oy * W_out + ox] += x_buf[iy * W_in + ix] * wv;
+                            }
                         }
                     }
                 }
@@ -106,20 +109,16 @@ __mlu_entry__ void conv_transpose2d_kernel(
 
         // 3. 偏置
         if (bias != nullptr) {
-            __memcpy(&b_val, bias + oc, sizeof(half), GDRAM2NRAM);
-            float bf = (float)b_val;
+            __memcpy(&b_val, bias + oc, sizeof(float), GDRAM2NRAM);
+            float bf = b_val;
             for (int i = 0; i < out_plane; ++i) {
                 out_buf[i] += bf;
             }
         }
 
-        // 4. 转 half 后写回（复用 x_buf 作为 half 输出缓冲）
-        for (int i = 0; i < out_plane; ++i) {
-            x_buf[i] = (half)out_buf[i];
-        }
-
+        // 4. 写回
         int out_base = (n * C_out + oc) * out_plane;
-        __memcpy(output + out_base, x_buf, out_plane * sizeof(half), NRAM2GDRAM);
+        __memcpy(output + out_base, out_buf, out_plane * sizeof(float), NRAM2GDRAM);
     }
 }
 
@@ -134,8 +133,8 @@ torch::Tensor bang_func(torch::Tensor x,
                         int output_padding,
                         int groups,
                         bool bias) {
-    auto x_contig = x.contiguous().to(torch::kFloat16);
-    auto k_contig = kernel.contiguous().to(torch::kFloat16);
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    auto k_contig = kernel.contiguous().to(torch::kFloat32);
 
     TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D (N, C_in, H, W)");
     TORCH_CHECK(k_contig.dim() == 4, "kernel must be 4-D (C_in, C_out/groups, K, K)");
@@ -165,20 +164,20 @@ torch::Tensor bang_func(torch::Tensor x,
     auto output = torch::empty({N, out_channels, H_out, W_out}, x_contig.options());
 
     torch::Tensor bias_tensor;
-    c10::Half *bias_ptr = nullptr;
+    float *bias_ptr = nullptr;
     if (bias) {
         bias_tensor = torch::zeros({out_channels}, x_contig.options());
-        bias_ptr = bias_tensor.data_ptr<c10::Half>();
+        bias_ptr = bias_tensor.data_ptr<float>();
     }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_dim = {16, 1, 1};
 
     conv_transpose2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
-        x_contig.data_ptr<c10::Half>(),
-        k_contig.data_ptr<c10::Half>(),
+        x_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
         bias_ptr,
-        output.data_ptr<c10::Half>(),
+        output.data_ptr<float>(),
         N, C_in, out_channels, H_in, W_in,
         K, stride, padding, output_padding, groups,
         H_out, W_out
