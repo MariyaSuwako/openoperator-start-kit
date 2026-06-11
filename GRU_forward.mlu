@@ -6,10 +6,6 @@
 
 #define DOT_CHUNK 256
 
-static inline float sigmoid_host(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
 __mlu_entry__ void gru_step_kernel(
     c10::Half *seq_input,
     c10::Half *h_prev,
@@ -145,13 +141,13 @@ __mlu_entry__ void gru_step_kernel(
             float r = r_x + (float)bias_half;
             __memcpy(&bias_half, bias_hh + h, sizeof(half), GDRAM2NRAM);
             r += r_h + (float)bias_half;
-            r = sigmoid_host(r);
+            r = 1.0f / (1.0f + expf(-r));
 
             __memcpy(&bias_half, bias_ih + hidden_size + h, sizeof(half), GDRAM2NRAM);
             float z = z_x + (float)bias_half;
             __memcpy(&bias_half, bias_hh + hidden_size + h, sizeof(half), GDRAM2NRAM);
             z += z_h + (float)bias_half;
-            z = sigmoid_host(z);
+            z = 1.0f / (1.0f + expf(-z));
 
             __memcpy(&bias_half, bias_ih + 2 * hidden_size + h, sizeof(half), GDRAM2NRAM);
             float n_val = n_x + (float)bias_half;
