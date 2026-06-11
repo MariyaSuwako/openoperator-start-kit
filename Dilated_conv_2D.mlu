@@ -1,0 +1,162 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define MAX_K2_ALIGNED 1024
+
+__mlu_entry__ void dilated_conv2d_kernel(
+    c10::Half *x,
+    c10::Half *weight,
+    c10::Half *bias,
+    c10::Half *output,
+    int N,
+    int C,
+    int OC,
+    int H,
+    int W,
+    int K,
+    int padding,
+    int dilation,
+    int H_out,
+    int W_out) {
+    uint32_t total_outs = (uint32_t)N * OC * H_out * W_out;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_outs / core_num;
+    uint32_t remainder = total_outs % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ half input_win[MAX_K2_ALIGNED];
+    __nram__ half weight_win[MAX_K2_ALIGNED];
+    __nram__ half mul_win[MAX_K2_ALIGNED];
+    __nram__ half sum_win[MAX_K2_ALIGNED];
+    __nram__ half out_val;
+    __nram__ half bias_val;
+
+    int K2 = K * K;
+    int aligned_k2 = (K2 + 63) & ~63;
+
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        int tmp = (int)idx;
+        int ow = tmp % W_out;
+        tmp /= W_out;
+        int oh = tmp % H_out;
+        tmp /= H_out;
+        int oc = tmp % OC;
+        tmp /= OC;
+        int n = tmp;
+
+        out_val = (half)0.0f;
+        int h_start = oh - padding;
+        int w_start = ow - padding;
+
+        for (int ic = 0; ic < C; ++ic) {
+            __bang_write_zero(input_win, aligned_k2);
+
+            for (int kh = 0; kh < K; ++kh) {
+                int in_h = h_start + kh * dilation;
+                if (in_h < 0 || in_h >= H) {
+                    continue;
+                }
+                for (int kw = 0; kw < K; ++kw) {
+                    int in_w = w_start + kw * dilation;
+                    if (in_w < 0 || in_w >= W) {
+                        continue;
+                    }
+                    int x_off = ((n * C + ic) * H + in_h) * W + in_w;
+                    __memcpy(input_win + kh * K + kw,
+                             x + x_off,
+                             sizeof(half),
+                             GDRAM2NRAM);
+                }
+            }
+
+            int w_off = (((oc * C) + ic) * K) * K;
+            __memcpy(weight_win,
+                     weight + w_off,
+                     K2 * sizeof(half),
+                     GDRAM2NRAM);
+            if (aligned_k2 > K2) {
+                __bang_write_zero(weight_win + K2, aligned_k2 - K2);
+            }
+
+            __bang_mul(mul_win, input_win, weight_win, aligned_k2);
+            __bang_reduce_sum(sum_win, mul_win, aligned_k2);
+            out_val = (half)((float)out_val + (float)sum_win[0]);
+        }
+
+        if (bias != nullptr) {
+            __memcpy(&bias_val, bias + oc, sizeof(half), GDRAM2NRAM);
+            out_val = (half)((float)out_val + (float)bias_val);
+        }
+
+        __memcpy(output + idx, &out_val, sizeof(half), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x,
+                        torch::Tensor kernel,
+                        int in_channels,
+                        int out_channels,
+                        int kernel_size,
+                        int padding,
+                        int dilation,
+                        bool bias) {
+    auto x_contig = x.contiguous().to(torch::kFloat16);
+    auto k_contig = kernel.contiguous().to(torch::kFloat16);
+
+    TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D [N, C, H, W]");
+    TORCH_CHECK(k_contig.dim() == 4, "kernel must be 4-D [OC, C, K, K]");
+
+    const int N = x_contig.size(0);
+    const int C = x_contig.size(1);
+    const int H = x_contig.size(2);
+    const int W = x_contig.size(3);
+    const int OC = k_contig.size(0);
+    const int K = k_contig.size(2);
+
+    TORCH_CHECK(C == in_channels, "in_channels mismatch");
+    TORCH_CHECK(OC == out_channels, "out_channels mismatch");
+    TORCH_CHECK(K == kernel_size, "kernel_size mismatch");
+    TORCH_CHECK(k_contig.size(1) == C, "kernel shape[1] must equal in_channels");
+    TORCH_CHECK(k_contig.size(3) == K, "kernel must be square");
+    TORCH_CHECK(K * K <= MAX_K2_ALIGNED, "kernel is too large for current NRAM buffer");
+
+    int eff_k = dilation * (K - 1) + 1;
+    int H_out = H + 2 * padding - eff_k + 1;
+    int W_out = W + 2 * padding - eff_k + 1;
+    TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
+
+    auto output = torch::empty({N, OC, H_out, W_out}, x_contig.options());
+
+    torch::Tensor bias_tensor;
+    c10::Half *bias_ptr = nullptr;
+    if (bias) {
+        bias_tensor = torch::zeros({OC}, x_contig.options());
+        bias_ptr = bias_tensor.data_ptr<c10::Half>();
+    }
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {16, 1, 1};
+
+    dilated_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
+        x_contig.data_ptr<c10::Half>(),
+        k_contig.data_ptr<c10::Half>(),
+        bias_ptr,
+        output.data_ptr<c10::Half>(),
+        N,
+        C,
+        OC,
+        H,
+        W,
+        K,
+        padding,
+        dilation,
+        H_out,
+        W_out
+    );
+
+    return output;
+}
