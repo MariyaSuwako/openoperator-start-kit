@@ -1,133 +1,128 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <c10/util/Half.h>
 
-#define MAX_K2_ALIGNED 1024
+// 默认场景：H=W=128, K=3, dilation=2, padding=2 -> H_out=W_out=128
+// 输入平面 = 输出平面 = 128*128 = 16384，留余量
+#define MAX_PLANE 20480
+#define MAX_K2 64
 
-
+// ---------- Dilated Conv 2D kernel (fp32, 向量化 gather) ----------
 __mlu_entry__ void dilated_conv2d_kernel(
-    c10::Half *x,
-    c10::Half *weight,
-    c10::Half *bias,
-    c10::Half *output,
-    int N,
-    int C,
-    int OC,
-    int H,
-    int W,
-    int K,
-    int padding,
-    int dilation,
-    int H_out,
-    int W_out) {
-    uint32_t total_outs = (uint32_t)N * OC * H_out * W_out;
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_outs / core_num;
-    uint32_t remainder = total_outs % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    float *x, float *weight, float *output,
+    int N, int C, int OC, int H, int W,
+    int K, int dilation, int padding,
+    int H_out, int W_out) {
 
-    __nram__ half input_win[MAX_K2_ALIGNED];
-    __nram__ half weight_win[MAX_K2_ALIGNED];
-    __nram__ half mul_win[MAX_K2_ALIGNED];
-    __nram__ half sum_win[MAX_K2_ALIGNED];
-    __nram__ half out_val;
-    __nram__ half bias_val;
+    uint32_t total_pairs = (uint32_t)N * (uint32_t)OC;
+    uint32_t core_id  = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_pairs / core_num;
+    uint32_t rem      = total_pairs % core_num;
+    uint32_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t count = per_core + (core_id < rem ? 1 : 0);
 
     int K2 = K * K;
-    int aligned_k2 = (K2 + 63) & ~63;
+    int x_plane   = H * W;
+    int out_plane = H_out * W_out;
 
-    for (uint32_t idx = start; idx < start + count; ++idx) {
-        int tmp = (int)idx;
-        int ow = tmp % W_out;
-        tmp /= W_out;
-        int oh = tmp % H_out;
-        tmp /= H_out;
-        int oc = tmp % OC;
-        tmp /= OC;
-        int n = tmp;
+    __nram__ float x_buf[MAX_PLANE];     // 当前 ic 输入平面
+    __nram__ float out_buf[MAX_PLANE];   // (n,oc) 输出累加器
+    __nram__ float tmp_buf[MAX_PLANE];   // 临时乘积
+    __nram__ float w_buf[MAX_K2];        // K*K 权重
 
-        out_val = (half)0.0f;
-        int h_start = oh - padding;
-        int w_start = ow - padding;
+    for (uint32_t pair_idx = start; pair_idx < start + count; ++pair_idx) {
+        int n  = (int)(pair_idx / (uint32_t)OC);
+        int oc = (int)(pair_idx % (uint32_t)OC);
 
+        // 1. 清零累加器
+        __bang_write_zero(out_buf, out_plane);
+
+        // 2. 遍历所有输入通道
         for (int ic = 0; ic < C; ++ic) {
-            __bang_write_zero(input_win, aligned_k2);
+            // 载入输入平面
+            int x_off_base = (n * C + ic) * x_plane;
+            __memcpy(x_buf, x + x_off_base, x_plane * sizeof(float), GDRAM2NRAM);
 
+            // 载入 K*K 权重 weight[oc, ic, :, :]
+            int w_off_base = (oc * C + ic) * K2;
+            __memcpy(w_buf, weight + w_off_base, K2 * sizeof(float), GDRAM2NRAM);
+
+            // 3. 对每个 (kh, kw) 做向量化 gather:
+            //    out[oh, ow] += w[kh,kw] * x[oh + kh*dilation - padding,
+            //                                ow + kw*dilation - padding]
             for (int kh = 0; kh < K; ++kh) {
-                int in_h = h_start + kh * dilation;
-                if (in_h < 0 || in_h >= H) {
-                    continue;
-                }
+                int kh_off = kh * dilation - padding;
+                // 有效 oh 范围：0 <= oh + kh_off < H
+                int oh_lo = (-kh_off > 0) ? -kh_off : 0;
+                int oh_hi_num = H - kh_off;
+                int oh_hi = (oh_hi_num < H_out) ? oh_hi_num : H_out;
+                if (oh_hi <= oh_lo) continue;
+
                 for (int kw = 0; kw < K; ++kw) {
-                    int in_w = w_start + kw * dilation;
-                    if (in_w < 0 || in_w >= W) {
-                        continue;
+                    int kw_off = kw * dilation - padding;
+                    int ow_lo = (-kw_off > 0) ? -kw_off : 0;
+                    int ow_hi_num = W - kw_off;
+                    int ow_hi = (ow_hi_num < W_out) ? ow_hi_num : W_out;
+                    if (ow_hi <= ow_lo) continue;
+                    int n_valid = ow_hi - ow_lo;
+
+                    float wv = w_buf[kh * K + kw];
+                    int iw_base = ow_lo + kw_off;  // 输入起始列
+
+                    for (int oh = oh_lo; oh < oh_hi; ++oh) {
+                        int ih = oh + kh_off;
+                        int src_off = ih * W + iw_base;
+                        int dst_off = oh * W_out + ow_lo;
+                        // out += wv * x   (按整行 n_valid 个元素向量化)
+                        __bang_mul_const(tmp_buf, x_buf + src_off, wv, n_valid);
+                        __bang_add(out_buf + dst_off, out_buf + dst_off,
+                                   tmp_buf, n_valid);
                     }
-                    int x_off = ((n * C + ic) * H + in_h) * W + in_w;
-                    __memcpy(input_win + kh * K + kw,
-                             x + x_off,
-                             sizeof(half),
-                             GDRAM2NRAM);
                 }
             }
-
-            int w_off = (((oc * C) + ic) * K) * K;
-            __memcpy(weight_win,
-                     weight + w_off,
-                     K2 * sizeof(half),
-                     GDRAM2NRAM);
-            if (aligned_k2 > K2) {
-                __bang_write_zero(weight_win + K2, aligned_k2 - K2);
-            }
-
-            __bang_mul(mul_win, input_win, weight_win, aligned_k2);
-            __bang_reduce_sum(sum_win, mul_win, aligned_k2);
-            out_val = (half)((float)out_val + (float)sum_win[0]);
         }
 
-        if (bias != nullptr) {
-            __memcpy(&bias_val, bias + oc, sizeof(half), GDRAM2NRAM);
-            out_val = (half)((float)out_val + (float)bias_val);
-        }
-
-        __memcpy(output + idx, &out_val, sizeof(half), NRAM2GDRAM);
+        // 4. 写回输出平面
+        int out_off_base = (n * OC + oc) * out_plane;
+        __memcpy(output + out_off_base, out_buf, out_plane * sizeof(float), NRAM2GDRAM);
     }
 }
 
+// ---------- 包装函数 (签名严格匹配题目: 7 参数, dilation 在 padding 之前) ----------
 torch::Tensor bang_func(torch::Tensor x,
                         torch::Tensor kernel,
                         int in_channels,
                         int out_channels,
                         int kernel_size,
-                        int padding,
-                        int dilation) {
-    auto x_contig = x.contiguous().to(torch::kFloat16);
-    auto k_contig = kernel.contiguous().to(torch::kFloat16);
+                        int dilation,
+                        int padding) {
+    auto x_contig = x.contiguous().to(torch::kFloat32);
+    auto k_contig = kernel.contiguous().to(torch::kFloat32);
 
     TORCH_CHECK(x_contig.dim() == 4, "x must be 4-D [N, C, H, W]");
     TORCH_CHECK(k_contig.dim() == 4, "kernel must be 4-D [OC, C, K, K]");
 
-    const int N = x_contig.size(0);
-    const int C = x_contig.size(1);
-    const int H = x_contig.size(2);
-    const int W = x_contig.size(3);
+    const int N  = x_contig.size(0);
+    const int C  = x_contig.size(1);
+    const int H  = x_contig.size(2);
+    const int W  = x_contig.size(3);
     const int OC = k_contig.size(0);
-    const int K = k_contig.size(2);
+    const int K  = k_contig.size(2);
 
-    TORCH_CHECK(C == in_channels, "in_channels mismatch");
+    TORCH_CHECK(C == in_channels,  "in_channels mismatch");
     TORCH_CHECK(OC == out_channels, "out_channels mismatch");
-    TORCH_CHECK(K == kernel_size, "kernel_size mismatch");
+    TORCH_CHECK(K == kernel_size,  "kernel_size mismatch");
     TORCH_CHECK(k_contig.size(1) == C, "kernel shape[1] must equal in_channels");
     TORCH_CHECK(k_contig.size(3) == K, "kernel must be square");
-    TORCH_CHECK(K * K <= MAX_K2_ALIGNED, "kernel is too large for current NRAM buffer");
+    TORCH_CHECK(K * K <= MAX_K2, "kernel too large for NRAM buffer");
 
     int eff_k = dilation * (K - 1) + 1;
     int H_out = H + 2 * padding - eff_k + 1;
     int W_out = W + 2 * padding - eff_k + 1;
     TORCH_CHECK(H_out > 0 && W_out > 0, "Invalid output dimensions");
+    TORCH_CHECK(H * W <= MAX_PLANE && H_out * W_out <= MAX_PLANE,
+                "plane too large for NRAM buffer (MAX_PLANE)");
 
     auto output = torch::empty({N, OC, H_out, W_out}, x_contig.options());
 
@@ -135,20 +130,12 @@ torch::Tensor bang_func(torch::Tensor x,
     cnrtDim3_t grid_dim = {16, 1, 1};
 
     dilated_conv2d_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
-        x_contig.data_ptr<c10::Half>(),
-        k_contig.data_ptr<c10::Half>(),
-        nullptr,
-        output.data_ptr<c10::Half>(),
-        N,
-        C,
-        OC,
-        H,
-        W,
-        K,
-        padding,
-        dilation,
-        H_out,
-        W_out
+        x_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, OC, H, W,
+        K, dilation, padding,
+        H_out, W_out
     );
 
     return output;
