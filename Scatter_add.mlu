@@ -19,15 +19,23 @@ __mlu_entry__ void scatter_add_kernel(
         end = N;
     }
 
+    __nram__ int dst_row_nram;
+    __nram__ float src_val;
+    __nram__ float dst_val;
+
     for (int i = start; i < end; ++i) {
-        int dst_row = index[i];
+        __memcpy(&dst_row_nram, index + i, sizeof(int), GDRAM2NRAM);
+        int dst_row = dst_row_nram;
         if (dst_row < 0 || dst_row >= dim_size) {
             continue;
         }
         int src_base = i * D;
         int dst_base = dst_row * D;
         for (int j = 0; j < D; ++j) {
-            output[dst_base + j] += src[src_base + j];
+            __memcpy(&src_val, src + src_base + j, sizeof(float), GDRAM2NRAM);
+            __memcpy(&dst_val, output + dst_base + j, sizeof(float), GDRAM2NRAM);
+            dst_val += src_val;
+            __memcpy(output + dst_base + j, &dst_val, sizeof(float), NRAM2GDRAM);
         }
     }
 }
