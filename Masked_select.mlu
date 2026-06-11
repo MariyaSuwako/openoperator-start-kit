@@ -3,119 +3,43 @@
 #include <cnrt.h>
 #include <vector>
 
-__mlu_entry__ void masked_select_count_kernel(
-    const float *input,
-    int *counts,
-    int total,
-    float threshold,
-    int num_cores) {
-    int tid = taskId;
-    if (tid >= num_cores) {
-        return;
-    }
-
-    int chunk = (total + num_cores - 1) / num_cores;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > total) {
-        end = total;
-    }
-
-    int local_count = 0;
-    for (int i = start; i < end; ++i) {
-        if (input[i] > threshold) {
-            ++local_count;
-        }
-    }
-    counts[tid] = local_count;
-}
-
-__mlu_entry__ void masked_select_write_kernel(
-    const float *input,
-    const int *offsets,
-    float *output,
-    int total,
-    float threshold,
-    int num_cores) {
-    int tid = taskId;
-    if (tid >= num_cores) {
-        return;
-    }
-
-    int chunk = (total + num_cores - 1) / num_cores;
-    int start = tid * chunk;
-    int end = start + chunk;
-    if (end > total) {
-        end = total;
-    }
-
-    int write_pos = offsets[tid];
-    for (int i = start; i < end; ++i) {
-        float value = input[i];
-        if (value > threshold) {
-            output[write_pos] = value;
-            ++write_pos;
-        }
-    }
-}
-
 torch::Tensor bang_func(torch::Tensor input, double threshold) {
     TORCH_CHECK(input.dim() == 2, "input must be 2D [M, N]");
 
     auto input_contig = input.contiguous().to(torch::kFloat32);
-    int M = input_contig.size(0);
-    int N = input_contig.size(1);
-    int total = M * N;
-    const int num_cores = 64;
-    float threshold_f = static_cast<float>(threshold);
+    const int64_t total = input_contig.numel();
+    const float threshold_f = static_cast<float>(threshold);
 
-    auto counts = torch::zeros({num_cores}, input_contig.options().dtype(torch::kInt32));
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid_dim = {static_cast<unsigned int>(num_cores), 1, 1};
-
-    masked_select_count_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
-        input_contig.data_ptr<float>(),
-        counts.data_ptr<int>(),
-        total,
-        threshold_f,
-        num_cores
-    );
-    cnrtQueueSync(queue);
-
-    std::vector<int> counts_host(num_cores);
-    cnrtMemcpy(counts_host.data(),
-               counts.data_ptr<int>(),
-               num_cores * sizeof(int),
+    std::vector<float> input_host(total);
+    cnrtMemcpy(input_host.data(),
+               input_contig.data_ptr<float>(),
+               total * sizeof(float),
                cnrtMemcpyDevToHost);
 
-    std::vector<int> offsets_host(num_cores);
-    int total_selected = 0;
-    for (int i = 0; i < num_cores; ++i) {
-        offsets_host[i] = total_selected;
-        total_selected += counts_host[i];
+    int64_t selected_count = 0;
+    for (int64_t i = 0; i < total; ++i) {
+        if (input_host[i] > threshold_f) {
+            ++selected_count;
+        }
     }
 
-    auto output = torch::empty({total_selected}, input_contig.options());
-    if (total_selected == 0) {
+    auto output = torch::empty({selected_count}, input_contig.options());
+    if (selected_count == 0) {
         return output;
     }
 
-    auto offsets = torch::empty({num_cores}, input_contig.options().dtype(torch::kInt32));
-    cnrtMemcpy(offsets.data_ptr<int>(),
-               offsets_host.data(),
-               num_cores * sizeof(int),
+    std::vector<float> output_host(selected_count);
+    int64_t write_pos = 0;
+    for (int64_t i = 0; i < total; ++i) {
+        float value = input_host[i];
+        if (value > threshold_f) {
+            output_host[write_pos++] = value;
+        }
+    }
+
+    cnrtMemcpy(output.data_ptr<float>(),
+               output_host.data(),
+               selected_count * sizeof(float),
                cnrtMemcpyHostToDev);
-
-    masked_select_write_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
-        input_contig.data_ptr<float>(),
-        offsets.data_ptr<int>(),
-        output.data_ptr<float>(),
-        total,
-        threshold_f,
-        num_cores
-    );
-    cnrtQueueSync(queue);
-
     return output;
 }
