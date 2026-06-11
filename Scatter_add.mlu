@@ -2,12 +2,19 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// 每个输出行最多支持的列宽（D 上限）；默认 D=256
-#define MAX_D 1024
-// 一次性加载到 NRAM 的最大 index 数（N 上限）；默认 N=4096
-#define MAX_N 8192
+// 按 D 维分割：每核负责 D 的一段（默认 D=256/16=16 floats）
+// 让全部 src 切片 / 全部 index / 整个累加器都常驻 NRAM，最大化数据复用
 
-// ---------- Scatter-add kernel (按输出行分工, 无 race) ----------
+// 注意: 这些上限决定 NRAM 占用，必须保守
+//   src_buf = MAX_N * MAX_D_CHUNK * 4B
+//   acc_buf = MAX_DIM_SIZE * MAX_D_CHUNK * 4B
+// 默认场景 (N=4096, D=256/16=16, dim_size=512)：
+//   src_buf = 4096*16*4 = 256KB, acc_buf = 512*16*4 = 32KB → 总 ~290KB，安全
+#define MAX_N         4096
+#define MAX_DIM_SIZE  512
+#define MAX_D_CHUNK   16
+
+// ---------- Scatter-add kernel (按 D 维分工) ----------
 __mlu_entry__ void scatter_add_kernel(
     float *src,
     int   *index,
@@ -16,39 +23,53 @@ __mlu_entry__ void scatter_add_kernel(
     int D,
     int dim_size) {
 
-    // 每核独占 dim_size 中的一段输出行 -> 零 race
-    uint32_t core_id  = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = dim_size / core_num;
-    uint32_t rem      = dim_size % core_num;
-    uint32_t row_start = core_id * per_core + (core_id < rem ? core_id : rem);
-    uint32_t row_count = per_core + (core_id < rem ? 1 : 0);
-    if (row_count == 0) return;
+    int core_id  = taskId;
+    int core_num = taskDim;
 
-    __nram__ int   idx_buf[MAX_N];     // 一次性载入全部 index
-    __nram__ float acc_buf[MAX_D];     // 当前输出行累加器
-    __nram__ float src_buf[MAX_D];     // 当前 src 行
+    // 每核负责 D 的一段
+    int d_per_core = D / core_num;
+    int d_rem      = D % core_num;
+    int d_start    = core_id * d_per_core + (core_id < d_rem ? core_id : d_rem);
+    int d_len      = d_per_core + (core_id < d_rem ? 1 : 0);
+    if (d_len == 0) return;
 
-    // 1. 把所有 index 加载到 NRAM
+    __nram__ int   idx_buf[MAX_N];
+    __nram__ float src_buf[MAX_N * MAX_D_CHUNK];        // src 切片
+    __nram__ float acc_buf[MAX_DIM_SIZE * MAX_D_CHUNK]; // 输出累加器
+
+    // 1. 一次性加载所有 index
     __memcpy(idx_buf, index, N * sizeof(int), GDRAM2NRAM);
 
-    // 2. 遍历本核负责的每个输出行
-    for (uint32_t r = row_start; r < row_start + row_count; ++r) {
-        int target = (int)r;
+    // 2. 用 stride DMA 一次性加载 src 的 D 切片 [N, d_len]
+    //    源步长 D*sizeof(float)，目的步长 d_len*sizeof(float)，共 N 段
+    __memcpy(src_buf, src + d_start,
+             d_len * sizeof(float),    // 每段大小
+             GDRAM2NRAM,
+             d_len * sizeof(float),    // dst stride (packed)
+             D * sizeof(float),        // src stride
+             N - 1);                   // 段数 - 1
 
-        // 清零累加器
-        __bang_write_zero(acc_buf, D);
+    // 3. 清零累加器 [dim_size, d_len]
+    __bang_write_zero(acc_buf, dim_size * d_len);
 
-        // 扫 N 个 index，命中则累加对应 src 行
-        for (int i = 0; i < N; ++i) {
-            if (idx_buf[i] != target) continue;
-            __memcpy(src_buf, src + i * D, D * sizeof(float), GDRAM2NRAM);
-            __bang_add(acc_buf, acc_buf, src_buf, D);
+    // 4. 在 NRAM 中扫描 + 累加（纯标量，但全在 NRAM，极快）
+    for (int i = 0; i < N; ++i) {
+        int target = idx_buf[i];
+        if (target < 0 || target >= dim_size) continue;
+        int acc_off = target * d_len;
+        int src_off = i * d_len;
+        for (int j = 0; j < d_len; ++j) {
+            acc_buf[acc_off + j] += src_buf[src_off + j];
         }
-
-        // 写回该输出行
-        __memcpy(output + (uint32_t)target * D, acc_buf, D * sizeof(float), NRAM2GDRAM);
     }
+
+    // 5. stride DMA 写回 output 的 D 切片 [dim_size, d_len]
+    __memcpy(output + d_start, acc_buf,
+             d_len * sizeof(float),
+             NRAM2GDRAM,
+             D * sizeof(float),        // dst stride
+             d_len * sizeof(float),    // src stride (packed)
+             dim_size - 1);
 }
 
 // ---------- 包装函数 ----------
@@ -65,14 +86,19 @@ torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
     int N = (int)src_contig.size(0);
     int D = (int)src_contig.size(1);
 
-    TORCH_CHECK(D <= MAX_D, "D exceeds NRAM buffer (MAX_D)");
-    TORCH_CHECK(N <= MAX_N, "N exceeds NRAM buffer (MAX_N)");
+    TORCH_CHECK(N <= MAX_N,                "N exceeds NRAM buffer (MAX_N)");
+    TORCH_CHECK(dim_size <= MAX_DIM_SIZE,  "dim_size exceeds NRAM buffer (MAX_DIM_SIZE)");
+
+    const int CORES = 16;
+    // 校验单核 D 段不超上限（向上取整）
+    int d_per_core_max = (D + CORES - 1) / CORES;
+    TORCH_CHECK(d_per_core_max <= MAX_D_CHUNK,
+                "D/cores exceeds MAX_D_CHUNK; increase MAX_D_CHUNK");
 
     auto output = torch::zeros({dim_size, D}, src_contig.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    // Union1 要求 taskDim 是 cluster 大小 (4) 的整数倍；用 16 与仓库其它 kernel 一致
-    cnrtDim3_t grid_dim = {16, 1, 1};
+    cnrtDim3_t grid_dim = {CORES, 1, 1};
 
     scatter_add_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
         src_contig.data_ptr<float>(),
@@ -80,6 +106,7 @@ torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
         output.data_ptr<float>(),
         N, D, dim_size
     );
+    cnrtQueueSync(queue);
 
     return output;
 }

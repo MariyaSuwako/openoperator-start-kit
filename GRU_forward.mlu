@@ -4,9 +4,23 @@
 #include <math.h>
 
 // 上限：默认 input=256, hidden=512
-#define MAX_INPUT  1024
-#define MAX_HIDDEN 1024
-#define MAX_3HIDDEN 3072
+// 注意：MAX_INPUT 在 linux/limits.h 已定义，必须改名避免宏冲突
+#define GRU_MAX_INPUT   1024
+#define GRU_MAX_HIDDEN  1024
+#define GRU_MAX_3HIDDEN 3072
+
+// __bang_reduce_sum 实际语义：按 32 个 float 一组做局部求和，
+// 结果分散写到 buf[0], buf[32], buf[64], ...
+// 所以拿完整点积要把 (aligned_len / 32) 个分组首位置加起来。
+static __mlu_func__ float reduce_full(float *buf, int aligned_len) {
+    __bang_reduce_sum(buf, buf, aligned_len);
+    int groups = aligned_len / 32;
+    float s = 0.0f;
+    for (int i = 0; i < groups; ++i) {
+        s += buf[i * 32];
+    }
+    return s;
+}
 
 // ---------- GRU 单步 kernel (fp32) ----------
 // 并行策略：每个核处理若干 (batch, hidden_unit) 对
@@ -36,19 +50,17 @@ __mlu_entry__ void gru_step_kernel(
     uint32_t count = per_core + (core_id < rem ? 1 : 0);
     if (count == 0) return;
 
-    __nram__ float x_buf[MAX_INPUT];
-    __nram__ float h_buf[MAX_HIDDEN];
-    __nram__ float w_buf[MAX_HIDDEN];
-    __nram__ float mul_buf[MAX_HIDDEN];
-    __nram__ float sum_buf[64];
-    __nram__ float b_ih_buf[MAX_3HIDDEN];
-    __nram__ float b_hh_buf[MAX_3HIDDEN];
+    __nram__ float x_buf[GRU_MAX_INPUT];
+    __nram__ float h_buf[GRU_MAX_HIDDEN];
+    __nram__ float w_buf[GRU_MAX_HIDDEN];
+    __nram__ float mul_buf[GRU_MAX_HIDDEN];
+    __nram__ float b_ih_buf[GRU_MAX_3HIDDEN];
+    __nram__ float b_hh_buf[GRU_MAX_3HIDDEN];
 
     // 一次性载入所有 bias
     __memcpy(b_ih_buf, bias_ih, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
     __memcpy(b_hh_buf, bias_hh, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
 
-    // 对齐尺寸（reduce_sum 通常要求 64 对齐）
     int iw_aligned = (input_width  + 63) & ~63;
     int hw_aligned = (hidden_size  + 63) & ~63;
 
@@ -78,66 +90,54 @@ __mlu_entry__ void gru_step_kernel(
         }
 
         // === 3 个 W_ih 点积 (input_width 维) ===
-        // r_x
         __memcpy(w_buf, weight_ih + h * weight_ih_width,
                  input_width * sizeof(float), GDRAM2NRAM);
         if (iw_aligned > input_width) {
             __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
         }
         __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
-        float r_x = sum_buf[0];
+        float r_x = reduce_full(mul_buf, iw_aligned);
 
-        // z_x
         __memcpy(w_buf, weight_ih + (hidden_size + h) * weight_ih_width,
                  input_width * sizeof(float), GDRAM2NRAM);
         if (iw_aligned > input_width) {
             __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
         }
         __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
-        float z_x = sum_buf[0];
+        float z_x = reduce_full(mul_buf, iw_aligned);
 
-        // n_x
         __memcpy(w_buf, weight_ih + (2 * hidden_size + h) * weight_ih_width,
                  input_width * sizeof(float), GDRAM2NRAM);
         if (iw_aligned > input_width) {
             __bang_write_zero(w_buf + input_width, iw_aligned - input_width);
         }
         __bang_mul(mul_buf, x_buf, w_buf, iw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, iw_aligned);
-        float n_x = sum_buf[0];
+        float n_x = reduce_full(mul_buf, iw_aligned);
 
         // === 3 个 W_hh 点积 (hidden_size 维) ===
-        // r_h
         __memcpy(w_buf, weight_hh + h * hidden_size,
                  hidden_size * sizeof(float), GDRAM2NRAM);
         if (hw_aligned > hidden_size) {
             __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
         }
         __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
-        float r_h = sum_buf[0];
+        float r_h = reduce_full(mul_buf, hw_aligned);
 
-        // z_h
         __memcpy(w_buf, weight_hh + (hidden_size + h) * hidden_size,
                  hidden_size * sizeof(float), GDRAM2NRAM);
         if (hw_aligned > hidden_size) {
             __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
         }
         __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
-        float z_h = sum_buf[0];
+        float z_h = reduce_full(mul_buf, hw_aligned);
 
-        // n_h
         __memcpy(w_buf, weight_hh + (2 * hidden_size + h) * hidden_size,
                  hidden_size * sizeof(float), GDRAM2NRAM);
         if (hw_aligned > hidden_size) {
             __bang_write_zero(w_buf + hidden_size, hw_aligned - hidden_size);
         }
         __bang_mul(mul_buf, h_buf, w_buf, hw_aligned);
-        __bang_reduce_sum(sum_buf, mul_buf, hw_aligned);
-        float n_h = sum_buf[0];
+        float n_h = reduce_full(mul_buf, hw_aligned);
 
         // === GRU 门方程 ===
         float r = 1.0f / (1.0f + expf(-(r_x + b_ih_buf[h] + r_h + b_hh_buf[h])));
@@ -174,11 +174,10 @@ torch::Tensor bang_func(torch::Tensor x,
                         int num_layers) {
     TORCH_CHECK(num_layers == 2, "this kernel only supports num_layers == 2");
     TORCH_CHECK(hidden_size > 0 && input_size > 0, "size must be positive");
-    TORCH_CHECK(hidden_size <= MAX_HIDDEN, "hidden_size too large");
-    TORCH_CHECK(input_size <= MAX_INPUT,  "input_size too large");
-    TORCH_CHECK(3 * hidden_size <= MAX_3HIDDEN, "3*hidden_size too large");
+    TORCH_CHECK(hidden_size <= GRU_MAX_HIDDEN, "hidden_size too large");
+    TORCH_CHECK(input_size <= GRU_MAX_INPUT,  "input_size too large");
+    TORCH_CHECK(3 * hidden_size <= GRU_MAX_3HIDDEN, "3*hidden_size too large");
 
-    // 全程 fp32 (精度关键)
     auto x_contig    = x.contiguous().to(torch::kFloat32);
     auto w_ih_l0_c   = weight_ih_l0.contiguous().to(torch::kFloat32);
     auto w_hh_l0_c   = weight_hh_l0.contiguous().to(torch::kFloat32);
