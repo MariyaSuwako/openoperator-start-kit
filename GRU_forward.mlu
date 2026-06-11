@@ -165,56 +165,56 @@ __mlu_entry__ void gru_step_kernel(
     }
 }
 
+// ============================================================
+// 包装函数：签名必须匹配评估脚本（init 参数全部展开）
+//   forward x        : 1 个 Tensor
+//   init 权重(8 个)  : weight_ih_l0/weight_hh_l0/bias_ih_l0/bias_hh_l0/
+//                      weight_ih_l1/weight_hh_l1/bias_ih_l1/bias_hh_l1
+//   init 标量(3 个)  : input_size, hidden_size, num_layers
+// ============================================================
 torch::Tensor bang_func(torch::Tensor x,
-                        torch::Tensor weight_ih,
-                        torch::Tensor weight_hh,
-                        torch::Tensor bias_ih,
-                        torch::Tensor bias_hh,
+                        torch::Tensor weight_ih_l0,
+                        torch::Tensor weight_hh_l0,
+                        torch::Tensor bias_ih_l0,
+                        torch::Tensor bias_hh_l0,
+                        torch::Tensor weight_ih_l1,
+                        torch::Tensor weight_hh_l1,
+                        torch::Tensor bias_ih_l1,
+                        torch::Tensor bias_hh_l1,
+                        int input_size,
                         int hidden_size,
                         int num_layers) {
-    auto x_contig = x.contiguous().to(torch::kFloat16);
-    auto w_ih_contig = weight_ih.contiguous().to(torch::kFloat16);
-    auto w_hh_contig = weight_hh.contiguous().to(torch::kFloat16);
-    auto b_ih_contig = bias_ih.contiguous().to(torch::kFloat16);
-    auto b_hh_contig = bias_hh.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(num_layers == 2, "this kernel only supports num_layers == 2 (per problem spec)");
+    TORCH_CHECK(hidden_size > 0 && input_size > 0, "input/hidden size must be positive");
+
+    auto x_contig    = x.contiguous().to(torch::kFloat16);
+    auto w_ih_l0_c   = weight_ih_l0.contiguous().to(torch::kFloat16);
+    auto w_hh_l0_c   = weight_hh_l0.contiguous().to(torch::kFloat16);
+    auto b_ih_l0_c   = bias_ih_l0.contiguous().to(torch::kFloat16);
+    auto b_hh_l0_c   = bias_hh_l0.contiguous().to(torch::kFloat16);
+    auto w_ih_l1_c   = weight_ih_l1.contiguous().to(torch::kFloat16);
+    auto w_hh_l1_c   = weight_hh_l1.contiguous().to(torch::kFloat16);
+    auto b_ih_l1_c   = bias_ih_l1.contiguous().to(torch::kFloat16);
+    auto b_hh_l1_c   = bias_hh_l1.contiguous().to(torch::kFloat16);
 
     TORCH_CHECK(x_contig.dim() == 3, "x must be 3-D [batch, seq_len, input_size]");
-    TORCH_CHECK(w_ih_contig.dim() == 3,
-                "weight_ih must be 3-D [num_layers, 3*hidden_size, input_dim_max]");
-    TORCH_CHECK(w_hh_contig.dim() == 3,
-                "weight_hh must be 3-D [num_layers, 3*hidden_size, hidden_size]");
-    TORCH_CHECK(b_ih_contig.dim() == 2,
-                "bias_ih must be 2-D [num_layers, 3*hidden_size]");
-    TORCH_CHECK(b_hh_contig.dim() == 2,
-                "bias_hh must be 2-D [num_layers, 3*hidden_size]");
-
-    const int batch = x_contig.size(0);
+    const int batch   = x_contig.size(0);
     const int seq_len = x_contig.size(1);
-    const int input_size = x_contig.size(2);
-    const int weight_ih_width = w_ih_contig.size(2);
+    TORCH_CHECK(x_contig.size(2) == input_size, "x last dim must equal input_size");
 
-    TORCH_CHECK(num_layers > 0, "num_layers must be positive");
-    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
-    TORCH_CHECK(w_ih_contig.size(0) == num_layers,
-                "weight_ih.size(0) must equal num_layers");
-    TORCH_CHECK(w_hh_contig.size(0) == num_layers,
-                "weight_hh.size(0) must equal num_layers");
-    TORCH_CHECK(b_ih_contig.size(0) == num_layers,
-                "bias_ih.size(0) must equal num_layers");
-    TORCH_CHECK(b_hh_contig.size(0) == num_layers,
-                "bias_hh.size(0) must equal num_layers");
-    TORCH_CHECK(w_ih_contig.size(1) == 3 * hidden_size,
-                "weight_ih.size(1) must equal 3 * hidden_size");
-    TORCH_CHECK(w_hh_contig.size(1) == 3 * hidden_size,
-                "weight_hh.size(1) must equal 3 * hidden_size");
-    TORCH_CHECK(w_hh_contig.size(2) == hidden_size,
-                "weight_hh.size(2) must equal hidden_size");
-    TORCH_CHECK(b_ih_contig.size(1) == 3 * hidden_size,
-                "bias_ih.size(1) must equal 3 * hidden_size");
-    TORCH_CHECK(b_hh_contig.size(1) == 3 * hidden_size,
-                "bias_hh.size(1) must equal 3 * hidden_size");
-    TORCH_CHECK(weight_ih_width >= input_size,
-                "weight_ih last dim must cover first-layer input_size");
+    // 形状校验
+    TORCH_CHECK(w_ih_l0_c.dim() == 2 && w_ih_l0_c.size(0) == 3 * hidden_size
+                && w_ih_l0_c.size(1) == input_size, "weight_ih_l0 shape mismatch");
+    TORCH_CHECK(w_hh_l0_c.dim() == 2 && w_hh_l0_c.size(0) == 3 * hidden_size
+                && w_hh_l0_c.size(1) == hidden_size, "weight_hh_l0 shape mismatch");
+    TORCH_CHECK(w_ih_l1_c.dim() == 2 && w_ih_l1_c.size(0) == 3 * hidden_size
+                && w_ih_l1_c.size(1) == hidden_size, "weight_ih_l1 shape mismatch");
+    TORCH_CHECK(w_hh_l1_c.dim() == 2 && w_hh_l1_c.size(0) == 3 * hidden_size
+                && w_hh_l1_c.size(1) == hidden_size, "weight_hh_l1 shape mismatch");
+    TORCH_CHECK(b_ih_l0_c.numel() == 3 * hidden_size, "bias_ih_l0 size mismatch");
+    TORCH_CHECK(b_hh_l0_c.numel() == 3 * hidden_size, "bias_hh_l0 size mismatch");
+    TORCH_CHECK(b_ih_l1_c.numel() == 3 * hidden_size, "bias_ih_l1 size mismatch");
+    TORCH_CHECK(b_hh_l1_c.numel() == 3 * hidden_size, "bias_hh_l1 size mismatch");
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid_dim = {16, 1, 1};
@@ -224,21 +224,20 @@ torch::Tensor bang_func(torch::Tensor x,
 
     for (int layer = 0; layer < num_layers; ++layer) {
         int cur_input_size = (layer == 0) ? input_size : hidden_size;
-        TORCH_CHECK(weight_ih_width >= cur_input_size,
-                    "weight_ih last dim is smaller than required layer input size");
+
+        c10::Half *layer_w_ih = (layer == 0) ? w_ih_l0_c.data_ptr<c10::Half>()
+                                              : w_ih_l1_c.data_ptr<c10::Half>();
+        c10::Half *layer_w_hh = (layer == 0) ? w_hh_l0_c.data_ptr<c10::Half>()
+                                              : w_hh_l1_c.data_ptr<c10::Half>();
+        c10::Half *layer_b_ih = (layer == 0) ? b_ih_l0_c.data_ptr<c10::Half>()
+                                              : b_ih_l1_c.data_ptr<c10::Half>();
+        c10::Half *layer_b_hh = (layer == 0) ? b_hh_l0_c.data_ptr<c10::Half>()
+                                              : b_hh_l1_c.data_ptr<c10::Half>();
+        int weight_ih_width = cur_input_size;
 
         cur_output = torch::empty({batch, seq_len, hidden_size}, x_contig.options());
         auto h_prev = torch::zeros({batch, hidden_size}, x_contig.options());
         auto h_next = torch::empty({batch, hidden_size}, x_contig.options());
-
-        c10::Half *layer_w_ih =
-            w_ih_contig.data_ptr<c10::Half>() + layer * (3 * hidden_size) * weight_ih_width;
-        c10::Half *layer_w_hh =
-            w_hh_contig.data_ptr<c10::Half>() + layer * (3 * hidden_size) * hidden_size;
-        c10::Half *layer_b_ih =
-            b_ih_contig.data_ptr<c10::Half>() + layer * (3 * hidden_size);
-        c10::Half *layer_b_hh =
-            b_hh_contig.data_ptr<c10::Half>() + layer * (3 * hidden_size);
 
         for (int step = 0; step < seq_len; ++step) {
             gru_step_kernel<<<grid_dim, cnrtFuncTypeUnion1, queue>>>(
