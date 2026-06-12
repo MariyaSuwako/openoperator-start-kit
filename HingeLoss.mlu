@@ -1,0 +1,94 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+
+#define CHUNK_SIZE 16384  // NRAM分块大小（half类型）
+#define ALIGN_SIZE 64     // 向量指令对齐长度（half为64对齐）
+
+__mlu_entry__ void hinge_loss_kernel(half *predictions, half *targets, 
+                                     half *partial_sums, int total_elements) {
+    __nram__ half nram_pred[CHUNK_SIZE];
+    __nram__ half nram_targ[CHUNK_SIZE];
+    __nram__ half nram_tmp[CHUNK_SIZE];
+    __nram__ half nram_reduce_out[CHUNK_SIZE];  // reduce_sum的输出buffer
+    
+    // 1. 多核任务拆分
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t elems_per_core = total_elements / core_num;
+    uint32_t remainder = total_elements % core_num;
+    uint32_t start = core_id * elems_per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = elems_per_core + (core_id < remainder ? 1 : 0);
+    
+    half core_sum = 0.0f;
+    
+    // 2. 分块处理当前核心分配的数据
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+        uint32_t aligned_len = (len + ALIGN_SIZE - 1) & ~(ALIGN_SIZE - 1);
+        
+        // 加载 predictions 和 targets
+        __memcpy(nram_pred, predictions + start + offset, len * sizeof(half), GDRAM2NRAM);
+        __memcpy(nram_targ, targets + start + offset, len * sizeof(half), GDRAM2NRAM);
+        
+        // 3. 核心计算: loss = max(0, 1 - pred * target)
+        // pred * target
+        __bang_mul(nram_tmp, nram_pred, nram_targ, aligned_len);
+        // 1 - pred * target
+        __bang_sub_scalar(nram_tmp, nram_tmp, (half)1.0f, aligned_len);
+        // 取负数让 __bang_active_relu 正常工作: 先取反，relu，再取反
+        // 但更好的做法: 因为 max(0, 1-x) = 1 - min(1, x) 不适用
+        // 直接用 __bang_active_relu(-nram_tmp) 再取负？
+        // 更简单: 直接标量循环或用 __bang_max 但那样不高效
+        // 这里使用 __bang_active_relu 计算 max(0, x) 需要正确输入
+        // 因为 ReLU 是 max(0, x)，而我们需要 max(0, 1 - p*t)
+        // 所以直接用 __bang_active_relu(nram_tmp) 即可
+        __bang_active_relu(nram_tmp, nram_tmp, aligned_len);
+        
+        // 4. 对当前块的 loss 进行归约求和
+        __bang_reduce_sum(nram_reduce_out, nram_tmp, aligned_len);
+        // 累加到 core_sum
+        core_sum += nram_reduce_out[0];
+    }
+    
+    // 5. 将每个核心的部分和写回 GDRAM（在主机端进行最终归约）
+    __memcpy(partial_sums + core_id, &core_sum, sizeof(half), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    TORCH_CHECK(predictions.is_contiguous(), "predictions must be contiguous");
+    TORCH_CHECK(targets.is_contiguous(), "targets must be contiguous");
+    TORCH_CHECK(predictions.sizes() == targets.sizes(), 
+                "predictions and targets must have the same shape");
+    
+    int total_elements = predictions.numel();
+    
+    // 准备存储每个核心部分和的数组
+    int num_cores = 64;
+    auto partial_sums = torch::empty({num_cores}, predictions.options());
+    
+    // 启动kernel
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {num_cores, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    
+    hinge_loss_kernel<<<dim, ktype, queue>>>(
+        predictions.data_ptr<half>(),
+        targets.data_ptr<half>(),
+        partial_sums.data_ptr<half>(),
+        total_elements
+    );
+    
+    // 将部分和拷贝回CPU并进行最终归约
+    auto partial_sums_cpu = partial_sums.to(torch::kCPU);
+    auto* sums = partial_sums_cpu.data_ptr<half>();
+    
+    float total_loss = 0.0f;
+    for (int i = 0; i < num_cores; ++i) {
+        total_loss += (float)sums[i];
+    }
+    total_loss /= total_elements;
+    
+    // 返回标量张量
+    return torch::tensor(total_loss, predictions.options());
+}
