@@ -40,7 +40,7 @@ __mlu_entry__ void hinge_loss_kernel(half *predictions, half *targets,
         // 但更好的做法: 因为 max(0, 1-x) = 1 - min(1, x) 不适用
         // 直接用 __bang_active_relu(-nram_tmp) 再取负？
         // 更简单: 直接标量循环或用 __bang_max 但那样不高效
-        // 这里使用 __bang_active_relu 计算 max(0, x) 需要正确输入
+        // 这里使用 __bang_active_relu 计算 max(0, x) 需要正确输入//
         // 因为 ReLU 是 max(0, x)，而我们需要 max(0, 1 - p*t)
         // 所以直接用 __bang_active_relu(nram_tmp) 即可
         __bang_active_relu(nram_tmp, nram_tmp, aligned_len);
