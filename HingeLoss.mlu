@@ -35,10 +35,8 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input1, c10::Half *input2, c10::H
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
-
     auto output = torch::empty_like(predictions);
-    int total = input.numel();
+    int total = predictions.numel();
 
     // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
