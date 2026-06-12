@@ -1,0 +1,72 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+
+#define MAX_DIM 16384  // 特征维度最大值（题目16384）
+
+__mlu_entry__ void softmax_kernel(half *input, half *output, int batch, int dim) {
+    // 1. 多核按行拆分
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t rows_per_core = batch / core_num;
+    uint32_t remainder = batch % core_num;
+    uint32_t start_row = core_id * rows_per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t num_rows = rows_per_core + (core_id < remainder ? 1 : 0);
+
+    // 2. NRAM 空间：整行数据、临时exp、广播最大值/和
+    __nram__ half nram_input[MAX_DIM];
+    __nram__ half nram_exp[MAX_DIM];
+    __nram__ half nram_reduce_out[MAX_DIM];  // reduce_sum 广播输出
+    float max_val;   // 标量最大值（float）
+    float sum_exp;   // 标量指数和
+
+    for (uint32_t r = 0; r < num_rows; ++r) {
+        uint32_t row_idx = start_row + r;
+        half *row_in = input + row_idx * dim;
+        half *row_out = output + row_idx * dim;
+
+        // 3. 加载整行到 NRAM
+        __memcpy(nram_input, row_in, dim * sizeof(half), GDRAM2NRAM);
+
+        // 4. 求该行最大值（广播结果）
+        __bang_max(nram_reduce_out, nram_input, dim);
+        max_val = (float)nram_reduce_out[0];
+
+        // 5. 计算 exp(x - max)
+        __bang_sub_scalar(nram_exp, nram_input, (half)max_val, dim);
+        __bang_active_exp(nram_exp, nram_exp, dim);
+
+        // 6. 求 exp 的和
+        __bang_reduce_sum(nram_reduce_out, nram_exp, dim);
+        sum_exp = (float)nram_reduce_out[0];
+
+        // 7. 归一化：除以 sum_exp
+        __bang_mul_scalar(nram_exp, nram_exp, (half)(1.0f / sum_exp), dim);
+
+        // 8. 写回输出
+        __memcpy(row_out, nram_exp, dim * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D [batch, dim]");
+    TORCH_CHECK(x.size(1) <= MAX_DIM, "Feature dimension exceeds MAX_DIM");
+
+    int batch = x.size(0);
+    int dim = x.size(1);
+
+    auto output = torch::empty_like(x);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim3 = {64, 1, 1};   // 64 个核心
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    softmax_kernel<<<dim3, ktype, queue>>>(
+        x.data_ptr<half>(),
+        output.data_ptr<half>(),
+        batch, dim
+    );
+
+    return output;
+}
