@@ -59,7 +59,7 @@ torch::Tensor bang_func(torch::Tensor x) {
     auto output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim3 = {64, 1, 1};   // 64 个核心
+    cnrtDim3_t dim3 = {64, 1, 1};   // 64 个核心//
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;//
 
     softmax_kernel<<<dim3, ktype, queue>>>(
