@@ -35,7 +35,7 @@ __mlu_entry__ void leakyrelu_kernel(c10::Half *input1, c10::Half *input2, c10::H
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    auto output = torch::empty_like(predictions);
+    auto output = torch::empty({128, 1}, predictions.options());
     int total = predictions.numel();
 
     // 获取 MLU 队列
